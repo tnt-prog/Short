@@ -2959,16 +2959,20 @@ with st.sidebar:
         value=bool(_snap_cfg.get("use_rsi_5m", True)), key="cfg_use_rsi_5m",
         help=(
             "F4 — 5-Minute RSI Filter\n\n"
-            "LONG : RSI(14) on last 50 × 5m candles must be ≥ the LONG minimum.\n"
-            "SHORT: RSI(14) must be ≤ the SHORT maximum.\n"
-            "Fast Stage-1 exit — coins failing here skip all further fetches."
+            "Fast Stage-1 exit — coins failing here skip all further fetches.\n"
+            "LONG and SHORT have INDEPENDENT thresholds (set separately below)."
         ))
-    _f4c1, _f4c2 = st.columns(2)
-    new_rsi5_min = _f4c1.number_input("5m RSI min (LONG)", min_value=0, max_value=100, step=1,
+
+    # LONG subsection
+    st.markdown("&nbsp;&nbsp;🔺 **LONG** — RSI must be ≥ this min")
+    new_rsi5_min = st.number_input("5m RSI min (LONG)", min_value=0, max_value=100, step=1,
                                     value=int(_snap_cfg.get("rsi_5m_min", 30)), key="cfg_rsi5",
                                     disabled=not new_use_rsi_5m,
                                     help="LONG qualifies when RSI ≥ this value.")
-    new_rsi5_max_short = _f4c2.number_input("5m RSI max (SHORT)", min_value=0, max_value=100, step=1,
+
+    # SHORT subsection
+    st.markdown("&nbsp;&nbsp;🔻 **SHORT** — RSI must be ≤ this max")
+    new_rsi5_max_short = st.number_input("5m RSI max (SHORT)", min_value=0, max_value=100, step=1,
                                     value=int(_snap_cfg.get("rsi_5m_max_short", 70)), key="cfg_rsi5_short",
                                     disabled=not new_use_rsi_5m,
                                     help="SHORT qualifies when RSI ≤ this value.")
@@ -2982,9 +2986,11 @@ with st.sidebar:
         help=(
             "F5 — 1-Hour RSI Filter\n\n"
             "RSI(14) on the 1h timeframe must fall within the direction-specific band.\n"
-            "LONG  band: protects against dead coins (min) and already-overbought entries (max).\n"
-            "SHORT band: protects against dead coins (min) and entries that are already oversold (max)."
+            "LONG and SHORT have INDEPENDENT bands (set separately below)."
         ))
+
+    # LONG subsection
+    st.markdown("&nbsp;&nbsp;🔺 **LONG** — RSI band")
     c3, c4 = st.columns(2)
     new_rsi1h_min = c3.number_input("1h min (LONG)", min_value=0, max_value=100, step=1,
                                      value=int(_snap_cfg.get("rsi_1h_min", 30)), key="cfg_rsi1h_min",
@@ -2992,6 +2998,9 @@ with st.sidebar:
     new_rsi1h_max = c4.number_input("1h max (LONG)", min_value=0, max_value=100, step=1,
                                      value=int(_snap_cfg.get("rsi_1h_max", 95)), key="cfg_rsi1h_max",
                                      disabled=not new_use_rsi_1h)
+
+    # SHORT subsection
+    st.markdown("&nbsp;&nbsp;🔻 **SHORT** — RSI band")
     c3s, c4s = st.columns(2)
     new_rsi1h_min_short = c3s.number_input("1h min (SHORT)", min_value=0, max_value=100, step=1,
                                      value=int(_snap_cfg.get("rsi_1h_min_short", 5)), key="cfg_rsi1h_min_short",
@@ -3307,36 +3316,47 @@ if getattr(_b, "_bsc_last_error", ""):
     st.warning(f"⚠️ {_b._bsc_last_error}")
 
 # ── Active filter badges ───────────────────────────────────────────────────────
-badges = []
-if _snap_cfg.get("use_pdz_15m", True): badges.append(f"🎯 F2 — PDZ 15m")
-if _snap_cfg.get("use_pdz_5m",  True): badges.append(f"🎯 F3 — PDZ 5m")
 _scan_dir_badge = str(_snap_cfg.get("scan_direction","both")).lower()
-badges.append({"long":"🔺 LONG only","short":"🔻 SHORT only","both":"🔺🔻 LONG + SHORT"}.get(_scan_dir_badge, "🔺🔻 LONG + SHORT"))
-if _snap_cfg.get("use_rsi_5m",  True):
-    if _scan_dir_badge == "short":
-        badges.append(f"📈 F4 — 5m RSI ≤{_snap_cfg.get('rsi_5m_max_short',70)} (SHORT)")
-    elif _scan_dir_badge == "long":
-        badges.append(f"📈 F4 — 5m RSI ≥{_snap_cfg.get('rsi_5m_min',30)}")
-    else:
-        badges.append(f"📈 F4 — 5m RSI L≥{_snap_cfg.get('rsi_5m_min',30)} · S≤{_snap_cfg.get('rsi_5m_max_short',70)}")
-if _snap_cfg.get("use_rsi_1h",  True):
-    if _scan_dir_badge == "short":
-        badges.append(f"📈 F5 — 1h RSI {_snap_cfg.get('rsi_1h_min_short',5)}–{_snap_cfg.get('rsi_1h_max_short',70)} (SHORT)")
-    elif _scan_dir_badge == "long":
-        badges.append(f"📈 F5 — 1h RSI {_snap_cfg.get('rsi_1h_min',30)}–{_snap_cfg.get('rsi_1h_max',95)}")
-    else:
-        badges.append(f"📈 F5 — 1h L{_snap_cfg.get('rsi_1h_min',30)}–{_snap_cfg.get('rsi_1h_max',95)} · S{_snap_cfg.get('rsi_1h_min_short',5)}–{_snap_cfg.get('rsi_1h_max_short',70)}")
-if _snap_cfg.get("use_ema_3m"):    badges.append(f"📉 F6 — EMA{_snap_cfg.get('ema_period_3m',12)} 3m")
-if _snap_cfg.get("use_ema_5m"):    badges.append(f"📉 F6 — EMA{_snap_cfg.get('ema_period_5m',12)} 5m")
-if _snap_cfg.get("use_ema_15m"):   badges.append(f"📉 F6 — EMA{_snap_cfg.get('ema_period_15m',12)} 15m")
+
+# Shared (direction-agnostic) filter badges — shown on every line
+_shared_badges = []
+if _snap_cfg.get("use_pdz_15m", True): _shared_badges.append(f"🎯 F2 — PDZ 15m")
+if _snap_cfg.get("use_pdz_5m",  True): _shared_badges.append(f"🎯 F3 — PDZ 5m")
+if _snap_cfg.get("use_ema_3m"):    _shared_badges.append(f"📉 F6 — EMA{_snap_cfg.get('ema_period_3m',12)} 3m")
+if _snap_cfg.get("use_ema_5m"):    _shared_badges.append(f"📉 F6 — EMA{_snap_cfg.get('ema_period_5m',12)} 5m")
+if _snap_cfg.get("use_ema_15m"):   _shared_badges.append(f"📉 F6 — EMA{_snap_cfg.get('ema_period_15m',12)} 15m")
 _macd_tfs = [tf for tf, k in [("3m","use_macd_3m"),("5m","use_macd_5m"),("15m","use_macd_15m")] if _snap_cfg.get(k, True)]
-if _macd_tfs: badges.append(f"📊 F7 — MACD 🟢↑ {' · '.join(_macd_tfs)}")
+if _macd_tfs: _shared_badges.append(f"📊 F7 — MACD 🟢↑ {' · '.join(_macd_tfs)}")
 _sar_tfs  = [tf for tf, k in [("3m","use_sar_3m"), ("5m","use_sar_5m"), ("15m","use_sar_15m")] if _snap_cfg.get(k, True)]
-if _sar_tfs:  badges.append(f"🪂 F8 — SAR {' · '.join(_sar_tfs)}")
-if _snap_cfg.get("use_vol_spike"): badges.append(
+if _sar_tfs:  _shared_badges.append(f"🪂 F8 — SAR {' · '.join(_sar_tfs)}")
+if _snap_cfg.get("use_vol_spike"): _shared_badges.append(
     f"📦 F9 — Vol ≥{_snap_cfg.get('vol_spike_mult',2.0)}× / {_snap_cfg.get('vol_spike_lookback',20)} 15m")
+
+# Direction-specific RSI badges
+_long_rsi_badges = []
+_short_rsi_badges = []
+if _snap_cfg.get("use_rsi_5m",  True):
+    _long_rsi_badges.append(f"📈 F4 — 5m RSI ≥{_snap_cfg.get('rsi_5m_min',30)}")
+    _short_rsi_badges.append(f"📈 F4 — 5m RSI ≤{_snap_cfg.get('rsi_5m_max_short',70)}")
+if _snap_cfg.get("use_rsi_1h",  True):
+    _long_rsi_badges.append(f"📈 F5 — 1h RSI {_snap_cfg.get('rsi_1h_min',30)}–{_snap_cfg.get('rsi_1h_max',95)}")
+    _short_rsi_badges.append(f"📈 F5 — 1h RSI {_snap_cfg.get('rsi_1h_min_short',5)}–{_snap_cfg.get('rsi_1h_max_short',70)}")
+
 st.markdown("**Active Filters:**")
-st.caption("  |  ".join(badges) if badges else "No advanced filters enabled")
+_shared_str = "  |  ".join(_shared_badges) if _shared_badges else "—"
+
+if _scan_dir_badge == "long":
+    _long_line = "  |  ".join(_long_rsi_badges + _shared_badges) if (_long_rsi_badges or _shared_badges) else "No advanced filters enabled"
+    st.markdown(f"🔺 **LONG Filters:**  {_long_line}")
+elif _scan_dir_badge == "short":
+    _short_line = "  |  ".join(_short_rsi_badges + _shared_badges) if (_short_rsi_badges or _shared_badges) else "No advanced filters enabled"
+    st.markdown(f"🔻 **SHORT Filters:**  {_short_line}")
+else:
+    # BOTH → two separate lines (LONG on top, SHORT below)
+    _long_line  = "  |  ".join(_long_rsi_badges + _shared_badges) if (_long_rsi_badges or _shared_badges) else "No advanced filters enabled"
+    _short_line = "  |  ".join(_short_rsi_badges + _shared_badges) if (_short_rsi_badges or _shared_badges) else "No advanced filters enabled"
+    st.markdown(f"🔺 **LONG Filters:**&nbsp;&nbsp;{_long_line}")
+    st.markdown(f"🔻 **SHORT Filters:**&nbsp;&nbsp;{_short_line}")
 st.divider()
 
 # ── Sector filter ──────────────────────────────────────────────────────────────
@@ -3951,20 +3971,38 @@ if fc.get("total_watchlist", 0) > 0:
             st.caption("⚠️ Config changed since last scan — funnel reflects the previous settings. "
                        "Rescan is in progress with the new config.")
 
-        # Which directions were scanned? only render a section if that direction's bucket
-        # exists AND it has at least some pre-filter activity recorded.
-        _dirs_to_render = []
+        # Honor the scan_direction config: render a section for every direction the user
+        # has enabled, even if it has no data yet (show a "no data" message instead).
+        _cfg_dir = str(sc.get("scan_direction", "both")).lower()
+        _configured_dirs = []
+        if _cfg_dir in ("long", "both"):  _configured_dirs.append("long")
+        if _cfg_dir in ("short", "both"): _configured_dirs.append("short")
+        if not _configured_dirs:          _configured_dirs = ["long"]
+
+        # Also include any direction that has data recorded but wasn't in the config
+        # (e.g. config changed mid-scan).
         for _d in ("long", "short"):
             _db = fc.get(_d, {})
             if isinstance(_db, dict) and (
                 _db.get("pre_filtered_out", 0) or _db.get("pre_filter_passed_syms") or _db.get("checked", 0)
             ):
-                _dirs_to_render.append(_d)
-        # Fallback: at least show Long if neither has data
-        if not _dirs_to_render:
-            _dirs_to_render = ["long"]
+                if _d not in _configured_dirs:
+                    _configured_dirs.append(_d)
+
+        _dirs_to_render = _configured_dirs
 
         _DIR_LABEL = {"long": "🔺 LONG", "short": "🔻 SHORT"}
+
+        def _has_direction_data(_db: dict) -> bool:
+            """True only if the scanner actually recorded activity for this direction."""
+            if not isinstance(_db, dict):
+                return False
+            return bool(
+                _db.get("pre_filtered_out", 0)
+                or _db.get("pre_filter_passed_syms")
+                or _db.get("checked", 0)
+                or _db.get("checked_syms")
+            )
 
         def _coin_str(s: set) -> str:
             return ", ".join(sorted(s)) if s else "—"
@@ -4168,12 +4206,35 @@ if fc.get("total_watchlist", 0) > 0:
                 key=f"stage_rows_{_dir}",
             )
 
-        # ── Render one section per scanned direction ────────────────────────────
+        # ── Render one section per configured direction ─────────────────────────
+        # Visually separate each direction: colored header + bordered container.
+        _HDR_COLOR = {"long": "#2ea043", "short": "#f85149"}   # green / red
+        _HDR_BG    = {"long": "rgba(46,160,67,0.08)", "short": "rgba(248,81,73,0.08)"}
+
         for _i, _d in enumerate(_dirs_to_render):
             if _i > 0:
-                st.markdown("---")
-            st.markdown(f"### {_DIR_LABEL[_d]} Funnel")
-            _render_direction_funnel(_d, fc.get(_d, {}), sc)
+                st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+
+            st.markdown(
+                f"<div style='padding:10px 14px;border-left:6px solid {_HDR_COLOR[_d]};"
+                f"background:{_HDR_BG[_d]};border-radius:6px;margin-bottom:8px;'>"
+                f"<span style='font-size:20px;font-weight:700;color:{_HDR_COLOR[_d]};'>"
+                f"{_DIR_LABEL[_d]} — Funnel &amp; Qualified Coins"
+                f"</span></div>",
+                unsafe_allow_html=True,
+            )
+
+            _db = fc.get(_d, {})
+            if not _has_direction_data(_db):
+                st.info(
+                    f"⚠️ No scan data yet for **{_DIR_LABEL[_d]}** — the scanner has not "
+                    f"completed a full cycle for this direction yet. "
+                    f"This section will populate after the next scan cycle completes."
+                )
+                continue
+
+            with st.container(border=True):
+                _render_direction_funnel(_d, _db, sc)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API Error Log  (bottom of page)
