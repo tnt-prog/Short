@@ -1,0 +1,3814 @@
+#!/usr/bin/env python3
+"""
+OKX Futures Scanner — Streamlit Dashboard  v2
+Performance improvements:
+  A. Bulk ticker pre-filter  — 1 API call eliminates ~70% of coins before any candle fetch
+  B. Parallel timeframe fetch — 4 timeframes fetched simultaneously per coin
+  C. Staged candle fetch      — quick 50-candle RSI/resistance check before full fetch
+  D. Symbol cache             — OKX instrument list cached for 6 h, not re-fetched every cycle
+  + API semaphore             — hard cap of 8 concurrent HTTP requests (no exchange blocking)
+
+v2 additions:
+  E. 15-trade Queue Limit     — when 15 open trades exist, new signals are logged as
+                                 status="queue_limit" (no order placed). The coin is NOT
+                                 blocked by active or cooldown filters — it is freely
+                                 re-scanned every cycle until a slot opens.
+  F. Alert column (col 2)     — signals table column 2 shows a quick visual status flag;
+                                 turns 🔴 red when an open trade's latest price has dropped
+                                 ≥5% below its entry price (early warning, before SL is hit).
+                                 Threshold constant: _PRICE_ALERT_PCT = 5.0
+"""
+
+import base64, hashlib, hmac, json, math, os, pathlib, threading, time, uuid, traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+
+import requests
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Network constants
+# ─────────────────────────────────────────────────────────────────────────────
+BASE          = "https://www.okx.com"
+OKX_INTERVALS = {"30m": "30m", "3m": "3m", "5m": "5m", "15m": "15m", "1h": "1H"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API rate-limiter  — hard cap: 8 concurrent HTTP requests at any time
+# OKX public-market limit is 20 req / 2 s.  Staying well below keeps us safe.
+# ─────────────────────────────────────────────────────────────────────────────
+_api_sem = threading.Semaphore(20)  # max concurrent in-flight requests
+# Rate limiter (_rate_wait) already caps at 15 req/s; semaphore just needs to
+# allow enough concurrent in-flight so the pipeline stays full at any latency.
+# Formula: slots = target_rps × round_trip_latency → 15 × 1.3s ≈ 20 slots.
+
+# ── Token-bucket rate limiter ─────────────────────────────────────────────────
+# OKX public candle endpoint: 40 req / 2 s = 20 req/s hard limit.
+# We target 15 req/s (75 % of limit) to stay safe regardless of network latency.
+# Semaphore alone is not enough — if OKX responds in <67 ms we still exceed 20/s.
+_RATE_INTERVAL  = 1.0 / 15          # 66.7 ms minimum between token grants
+_rate_lock       = threading.Lock()
+_rate_last_grant = 0.0              # timestamp of the last granted token
+
+def _rate_wait():
+    """Block the calling thread until its turn within the 15 req/s budget."""
+    global _rate_last_grant
+    while True:
+        with _rate_lock:
+            now  = time.time()
+            wait = _rate_last_grant + _RATE_INTERVAL - now
+            if wait <= 0:
+                _rate_last_grant = now
+                return                  # token granted — proceed immediately
+        time.sleep(max(0.001, wait))    # sleep outside lock so others can check
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Symbol-cache TTL  (D)
+# ─────────────────────────────────────────────────────────────────────────────
+_SYMBOL_CACHE_TTL = 6 * 3600   # refresh OKX instrument list every 6 hours
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bulk pre-filter thresholds  (A)
+# ─────────────────────────────────────────────────────────────────────────────
+PRE_FILTER_MIN_VOL_USDT  =  100_000   # minimum 24 h USDT volume
+PRE_FILTER_LOW_BUFFER    =    1.005   # price must be ≥ 0.5 % above 24 h low
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dubai Timezone (UTC+4, no DST)
+# ─────────────────────────────────────────────────────────────────────────────
+DUBAI_TZ = timezone(timedelta(hours=4))
+
+def dubai_now() -> datetime:
+    return datetime.now(DUBAI_TZ)
+
+def to_dubai(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(DUBAI_TZ)
+
+def fmt_dubai(iso_str: str, fmt: str = "%m/%d %H:%M") -> str:
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return to_dubai(dt).strftime(fmt)
+    except Exception:
+        return iso_str[:16] if iso_str else "—"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Default configuration
+# ─────────────────────────────────────────────────────────────────────────────
+DEFAULT_CONFIG: dict = {
+    "tp_pct":               1.5,
+    "sl_pct":               3.0,
+    # ── per-filter enable/disable ──────────────────────────────────────────────
+    "use_pre_filter":       True,   # Bulk ticker pre-filter (volume / change / low)
+    "use_rsi_5m":           True,   # F4 — 5m RSI
+    "rsi_5m_min":           30,
+    "use_rsi_1h":           True,   # F5 — 1h RSI
+    "rsi_1h_min":           30,
+    "rsi_1h_max":           95,
+    "loop_minutes":         5,
+    "cooldown_minutes":     5,
+    "use_ema_3m":           False,
+    "ema_period_3m":      12,
+    "use_ema_5m":         True,
+    "ema_period_5m":      12,
+    "use_ema_15m":        True,
+    "ema_period_15m":     12,
+    "use_macd_3m":        True,   # F7 — MACD dark-green (3m)
+    "use_macd_5m":        True,   # F7 — MACD dark-green (5m)
+    "use_macd_15m":       True,   # F7 — MACD dark-green (15m)
+    "use_sar_3m":         True,   # F8 — Parabolic SAR (3m)
+    "use_sar_5m":         True,   # F8 — Parabolic SAR (5m)
+    "use_sar_15m":        True,   # F8 — Parabolic SAR (15m)
+    "use_vol_spike":      False,
+    "vol_spike_mult":     2.0,
+    "vol_spike_lookback": 20,
+    "use_pdz_5m":            True,   # F3 — PDZ (5m)
+    "use_pdz_15m":           True,   # F2 — PDZ (15m)
+    # ── Auto-trading (OKX Demo / Live) ────────────────────────────────────────
+    "trade_enabled":         False,
+    "demo_mode":             True,   # True = Demo API, False = Live API
+    "api_key":               "",
+    "api_secret":            "",
+    "api_passphrase":        "",
+    "trade_usdt_amount":     10.0,   # USDT collateral per trade (before leverage)
+    "trade_leverage":        10,     # leverage applied (capped by MAX_LEVERAGE)
+    "trade_margin_mode":     "isolated",  # "cross" or "isolated"
+        "watchlist": [
+        "XPDUSDT","WIFUSDT","PIUSDT","EDGEUSDT","RECALLUSDT","SUSHIUSDT","RAVEUSDT","XLMUSDT","DASHUSDT","TRUSTUSDT",
+        "GPSUSDT","CROUSDT","ACUUSDT","UNIUSDT","STRKUSDT","NEIROUSDT","ZKPUSDT","APEUSDT","MSTRUSDT","ENJUSDT",
+        "INJUSDT","RAYUSDT","OLUSDT","HUSDT","OKBUSDT","APTUSDT","WCTUSDT","NEOUSDT","SNXUSDT","LITUSDT",
+        "WUSDT","SYRUPUSDT","AVAXUSDT","LPTUSDT","ACTUSDT","FLOKIUSDT","MSFTUSDT","MEMEUSDT","DOGEUSDT","KGENUSDT",
+        "MOODENGUSDT","NOTUSDT","XCUUSDT","AEROUSDT","STXUSDT","GIGGLEUSDT","AUCTIONUSDT","WALUSDT","ETHUSDT","SHIBUSDT",
+        "ZROUSDT","GMXUSDT","LAYERUSDT","ARBUSDT","MINAUSDT","IMXUSDT","LINEAUSDT","PUMPUSDT","VANAUSDT","FOGOUSDT",
+        "BASEDUSDT","ZBTUSDT","KITEUSDT","XTZUSDT","SUIUSDT","ATHUSDT","AIXBTUSDT","TRIAUSDT","PIPPINUSDT","ANIMEUSDT",
+        "PEPEUSDT","LRCUSDT","DYDXUSDT","LAUSDT","GLMUSDT","CHZUSDT","ACHUSDT","INITUSDT","PLUMEUSDT","BCHUSDT",
+        "BLURUSDT","SENTUSDT","ALLOUSDT","XPTUSDT","QQQUSDT","YGGUSDT","AAVEUSDT","METISUSDT","ZAMAUSDT","ZKUSDT",
+        "MERLUSDT","EGLDUSDT","AVNTUSDT","HMSTRUSDT","AGLDUSDT","ONTUSDT","ALGOUSDT","ADAUSDT","TRUMPUSDT","MEUSDT",
+        "NFLXUSDT","GALAUSDT","BONKUSDT","LUNAUSDT","XAGUSDT","TRXUSDT","BEATUSDT","BABYUSDT","EDENUSDT","PNUTUSDT",
+        "BICOUSDT","IWMUSDT","ICPUSDT","METAUSDT","BANDUSDT","LDOUSDT","OFCUSDT","SATSUSDT","ZRXUSDT","ZECUSDT",
+        "MORPHOUSDT","QTUMUSDT","SPACEUSDT","SIGNUSDT","AMZNUSDT","TRUTHUSDT","YFIUSDT","1INCHUSDT","BRETTUSDT","SOLUSDT",
+        "RIVERUSDT","FARTCOINUSDT","API3USDT","DOTUSDT","HOODUSDT","JELLYJELLYUSDT","STABLEUSDT","FUSDT","DOODUSDT","COAIUSDT",
+        "WLFIUSDT","USDCUSDT","IPUSDT","ATUSDT","WLDUSDT","LQTYUSDT","IOTAUSDT","TRBUSDT","RVNUSDT","ORCLUSDT",
+        "KSMUSDT","CFXUSDT","SOPHUSDT","BARDUSDT","UMAUSDT","ZENUSDT","2ZUSDT","YBUSDT","CRCLUSDT","RENDERUSDT",
+        "JUPUSDT","MAGICUSDT","TURBOUSDT","ORDIUSDT","PYTHUSDT","ETCUSDT","MEWUSDT","CRVUSDT","MUBARAKUSDT","BIGTIMEUSDT",
+        "ORDERUSDT","VIRTUALUSDT","INTCUSDT","THETAUSDT","ONDOUSDT","LTCUSDT","SPKUSDT","AUSDT","ROBOUSDT","EWJUSDT",
+        "ASTERUSDT","BREVUSDT","IOSTUSDT","BTCUSDT","EWYUSDT","BNBUSDT","SAHARAUSDT","MONUSDT","AAPLUSDT","RSRUSDT",
+        "SPYUSDT","KAITOUSDT","LINKUSDT","NMRUSDT","CRWVUSDT","TSLAUSDT","XPLUSDT","COMPUSDT","ENAUSDT","CCUSDT",
+        "USELESSUSDT","PLTRUSDT","RLSUSDT","HOMEUSDT","GRTUSDT","LIGHTUSDT","KATUSDT","LABUSDT","JTOUSDT","FILUSDT",
+        "TIAUSDT","MUUSDT","SKYUSDT","ENSUSDT","NVDAUSDT","BOMEUSDT","PIEVERSEUSDT","0GUSDT","GASUSDT","SEIUSDT",
+        "OPUSDT","AMDUSDT","BIOUSDT","COREUSDT","MOVEUSDT","NGUSDT","GRASSUSDT","KMNOUSDT","SAPIENUSDT","OPNUSDT",
+        "TONUSDT","ATOMUSDT","ETHWUSDT","ONEUSDT","COINUSDT","ESPUSDT","XAUUSDT","NIGHTUSDT","BSBUSDT","PENGUUSDT",
+        "ETHFIUSDT","SSVUSDT","CVXUSDT","RESOLVUSDT","UPUSDT","METUSDT","SANDUSDT","CELOUSDT","SNDKUSDT","MANAUSDT",
+        "POPCATUSDT","TAOUSDT","ARUSDT","FLOWUSDT","SUSDT","AZTECUSDT","ARKMUSDT","WETUSDT","HUMAUSDT","APRUSDT",
+        "AEVOUSDT","CLUSDT","BATUSDT","ZORAUSDT","BERAUSDT","TSMUSDT","HYPEUSDT","WOOUSDT","PEOPLEUSDT","PENDLEUSDT",
+        "SOONUSDT","MMTUSDT","EIGENUSDT","POLUSDT","PROVEUSDT","GMTUSDT","ZILUSDT","PARTIUSDT","MASKUSDT","ENSOUSDT",
+        "BZUSDT","NEARUSDT","SHELLUSDT","ZETAUSDT","GOOGLUSDT","XRPUSDT","HBARUSDT","ICXUSDT","SPXUSDT","AXSUSDT",
+    ],
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sector tags
+# ─────────────────────────────────────────────────────────────────────────────
+SECTORS: dict = {
+    "FETUSDT":"AI","RENDERUSDT":"AI","AIXBTUSDT":"AI","GRTUSDT":"AI",
+    "AGLDUSDT":"AI","AIAUSDT":"AI","AINUSDT":"AI","UAIUSDT":"AI",
+    "ARKMUSDT":"AI","VIRTUALUSDT":"AI","SKYAIUSDT":"AI","DEEPUSDT":"AI",
+    "ZECUSDT":"Privacy","DASHUSDT":"Privacy","XMRUSDT":"Privacy",
+    "DUSKUSDT":"Privacy","POLYXUSDT":"Privacy",
+    "BTCUSDT":"BTC","ORDIUSDT":"BTC",
+    "ETHUSDT":"L1","SOLUSDT":"L1","AVAXUSDT":"L1","ADAUSDT":"L1",
+    "DOTUSDT":"L1","NEARUSDT":"L1","APTUSDT":"L1","SUIUSDT":"L1",
+    "TONUSDT":"L1","XLMUSDT":"L1","TRXUSDT":"L1","LTCUSDT":"L1",
+    "BCHUSDT":"L1","XRPUSDT":"L1","BNBUSDT":"L1","ATOMUSDT":"L1",
+    "ARBUSDT":"L2","OPUSDT":"L2","STRKUSDT":"L2","ZKUSDT":"L2",
+    "LINEAUSDT":"L2","POLUSDT":"L2","IMXUSDT":"L2",
+    "AAVEUSDT":"DeFi","UNIUSDT":"DeFi","CRVUSDT":"DeFi","COMPUSDT":"DeFi",
+    "SNXUSDT":"DeFi","DYDXUSDT":"DeFi","PENDLEUSDT":"DeFi","AEROUSDT":"DeFi",
+    "MORPHOUSDT":"DeFi","1INCHUSDT":"DeFi","CAKEUSDT":"DeFi","LDOUSDT":"DeFi",
+    "DOGEUSDT":"Meme","1000PEPEUSDT":"Meme","1000SHIBUSDT":"Meme",
+    "1000BONKUSDT":"Meme","1000FLOKIUSDT":"Meme","FARTCOINUSDT":"Meme",
+    "MEMEUSDT":"Meme","BOMEUSDT":"Meme","TURBOUSDT":"Meme","NEIROUSDT":"Meme",
+    "SANDUSDT":"Gaming","MANAUSDT":"Gaming","GALAUSDT":"Gaming",
+    "AXSUSDT":"Gaming","ALICEUSDT":"Gaming","APEUSDT":"Gaming",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Max leverage tiers
+# ─────────────────────────────────────────────────────────────────────────────
+MAX_LEVERAGE: dict = {
+    "BTCUSDT":125,"ETHUSDT":100,
+    "SOLUSDT":75,"BNBUSDT":75,"XRPUSDT":75,"DOGEUSDT":75,
+    "ADAUSDT":75,"LTCUSDT":75,"BCHUSDT":75,"TRXUSDT":75,
+    "XLMUSDT":75,"DOTUSDT":75,"AVAXUSDT":75,"LINKUSDT":75,
+    "UNIUSDT":75,"ATOMUSDT":75,"ETCUSDT":75,
+    "NEARUSDT":50,"APTUSDT":50,"SUIUSDT":50,"ARBUSDT":50,
+    "OPUSDT":50,"INJUSDT":50,"TONUSDT":50,"AAVEUSDT":50,
+    "LDOUSDT":50,"FILUSDT":50,"IMXUSDT":50,"STXUSDT":50,
+    "ORDIUSDT":50,"WLDUSDT":50,"JUPUSDT":50,"PENDLEUSDT":50,
+    "CRVUSDT":50,"TIAUSDT":50,"SEIUSDT":50,"TAOUSDT":50,
+    "RENDERUSDT":50,"FETUSDT":50,"HBARUSDT":50,"MANTRAUSDT":50,
+    "SANDUSDT":50,"GALAUSDT":50,"AXSUSDT":50,"APEUSDT":50,
+    "GRTUSDT":50,"ENAUSDT":50,"POLUSDT":50,"STRKUSDT":50,
+    "ZKUSDT":50,"DYDXUSDT":50,"SNXUSDT":50,"COMPUSDT":50,
+    "ARUSDT":50,"KASUSDT":50,"VETUSDT":50,"ICPUSDT":50,
+}
+
+def get_max_leverage(sym: str) -> int:
+    return MAX_LEVERAGE.get(sym, 20)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SL reason analyzer
+# ─────────────────────────────────────────────────────────────────────────────
+def analyze_sl_reason(sig: dict) -> str:
+    """
+    Post-mortem analysis of a stopped-out trade using data captured at entry.
+    Pure computation — no API calls, no I/O. Safe to call during UI render.
+    Produces specific, actionable observations and improvement suggestions.
+    """
+    criteria = sig.get("criteria", {})
+    reasons  = []
+    improve  = []   # improvement suggestions for next release
+
+    # ── Helper: safe float conversion (criteria may store "—" strings) ────────
+    def _f(key, default=None):
+        try:
+            v = criteria.get(key, default)
+            return float(v) if v not in (None, "—", "") else default
+        except (TypeError, ValueError):
+            return default
+
+    # ── 1. Speed of loss ─────────────────────────────────────────────────────
+    # Fast SL = bad entry timing.  Slow SL = sustained trend reversal.
+    duration_mins = None
+    try:
+        if sig.get("timestamp") and sig.get("close_time"):
+            t_open  = datetime.fromisoformat(sig["timestamp"].replace("Z", "+00:00"))
+            t_close = datetime.fromisoformat(sig["close_time"].replace("Z", "+00:00"))
+            duration_mins = int((t_close - t_open).total_seconds() / 60)
+    except Exception:
+        pass
+
+    if duration_mins is not None:
+        if duration_mins <= 5:
+            reasons.append(
+                f"SL hit in {duration_mins} min — entry was at a local price peak. "
+                f"Consider adding a 1–2 candle confirmation delay before entry.")
+            improve.append("Add 1-candle confirmation delay (wait for close above entry signal)")
+        elif duration_mins <= 15:
+            reasons.append(
+                f"SL hit in {duration_mins} min — very fast reversal. "
+                f"Momentum faded immediately after entry.")
+            improve.append("Tighten entry timing — require EMA alignment on 3m before entry")
+        elif duration_mins >= 120:
+            reasons.append(
+                f"Trade held {duration_mins} min before SL — sustained trend reversal. "
+                f"Macro / higher-TF bias likely shifted after entry.")
+            improve.append("Add 4h or daily trend filter to avoid counter-trend entries")
+
+    # ── 2. Super Setup bypass ─────────────────────────────────────────────────
+    if sig.get("is_super_setup"):
+        reasons.append(
+            "Super Setup — 15m Discount zone bypassed all filters. "
+            "No RSI / MACD / SAR confirmation was required.")
+        improve.append(
+            "Consider requiring at least RSI 5m ≥ 40 even for Super Setups "
+            "to avoid entering during momentum exhaustion")
+
+    # ── 3. PDZ zone risk ──────────────────────────────────────────────────────
+    pdz_5m  = str(criteria.get("pdz_zone_5m",  "") or "")
+    pdz_15m = str(criteria.get("pdz_zone_15m", "") or "")
+    for zone_label, zone_val in [("5m", pdz_5m), ("15m", pdz_15m)]:
+        if "BandA" in zone_val:
+            reasons.append(
+                f"PDZ {zone_label} zone was {zone_val} — price was near the Premium "
+                f"boundary. BandA entries carry higher reversal risk than Discount entries.")
+            improve.append(
+                f"Consider restricting {zone_label} PDZ to Discount + Equilibrium only "
+                f"(disable BandA/BandB) for lower-risk entries")
+        elif "BandB" in zone_val:
+            reasons.append(
+                f"PDZ {zone_label} zone was {zone_val} — borderline zone with elevated "
+                f"Premium exposure. Higher false-signal rate than Discount.")
+            improve.append(
+                f"Tighten {zone_label} PDZ to Discount / Equilibrium to reduce BandB SL rate")
+        elif "Premium" in zone_val:
+            reasons.append(
+                f"PDZ {zone_label} zone was Premium — price was in overbought territory "
+                f"at entry. This zone has the highest reversal probability.")
+
+    # ── 4. RSI analysis ───────────────────────────────────────────────────────
+    rsi_5m = _f("rsi_5m")
+    rsi_1h = _f("rsi_1h")
+
+    if rsi_5m is not None:
+        if rsi_5m < 35:
+            reasons.append(
+                f"RSI 5m was very low at entry ({rsi_5m:.1f}) — short-term momentum "
+                f"was already fading before trade opened.")
+            improve.append("Raise RSI 5m minimum threshold (e.g. 42 → 48) to avoid fading momentum")
+        elif rsi_5m < 42:
+            reasons.append(
+                f"RSI 5m borderline ({rsi_5m:.1f}) — weak short-term momentum at entry.")
+        elif rsi_5m > 75:
+            reasons.append(
+                f"RSI 5m was high at entry ({rsi_5m:.1f}) — near overbought on 5m, "
+                f"limited upside headroom.")
+            improve.append("Add RSI 5m upper cap (e.g. max 72) to avoid overbought entries")
+
+    if rsi_1h is not None:
+        if rsi_1h > 82:
+            reasons.append(
+                f"RSI 1h near overbought ({rsi_1h:.1f}) — hourly timeframe showing "
+                f"exhaustion. Higher-TF reversal likely.")
+            improve.append("Lower RSI 1h maximum threshold (e.g. 95 → 80)")
+        elif rsi_1h < 40:
+            reasons.append(
+                f"RSI 1h weak ({rsi_1h:.1f}) — no bullish higher-TF support at entry.")
+            improve.append("Raise RSI 1h minimum threshold (e.g. 30 → 45)")
+
+    # ── 5. RSI divergence (5m strong but 1h weak) ────────────────────────────
+    if rsi_5m is not None and rsi_1h is not None:
+        if rsi_5m >= 55 and rsi_1h < 45:
+            reasons.append(
+                f"RSI divergence — 5m ({rsi_5m:.1f}) was bullish but 1h ({rsi_1h:.1f}) "
+                f"was bearish. Short-term bounce against the hourly trend.")
+            improve.append(
+                "Enforce RSI 1h ≥ RSI 5m × 0.75 to reduce timeframe divergence entries")
+
+    # ── 6. MACD status at entry ───────────────────────────────────────────────
+    macd_flags = {
+        "3m":  criteria.get("macd_3m"),
+        "5m":  criteria.get("macd_5m"),
+        "15m": criteria.get("macd_15m"),
+    }
+    disabled_macd = [tf for tf, v in macd_flags.items() if v in (None, "—", "")]
+    false_macd    = [tf for tf, v in macd_flags.items()
+                     if str(v).strip().lower() in ("false", "0", "no")]
+    if disabled_macd:
+        reasons.append(
+            f"MACD was disabled for {', '.join(disabled_macd)} timeframe(s) at entry — "
+            f"no histogram confirmation on those timeframes.")
+        improve.append(
+            f"Enable MACD on {', '.join(disabled_macd)} for additional confirmation")
+    if false_macd:
+        reasons.append(
+            f"MACD was bearish on {', '.join(false_macd)} timeframe(s) at entry — "
+            f"filter was active but histogram was dark-red / declining.")
+
+    # ── 7. SAR status at entry ────────────────────────────────────────────────
+    sar_flags = {
+        "3m":  criteria.get("sar_3m"),
+        "5m":  criteria.get("sar_5m"),
+        "15m": criteria.get("sar_15m"),
+    }
+    disabled_sar = [tf for tf, v in sar_flags.items() if v in (None, "—", "")]
+    if disabled_sar:
+        reasons.append(
+            f"Parabolic SAR was disabled for {', '.join(disabled_sar)} timeframe(s) — "
+            f"no trend-direction confirmation on those timeframes.")
+        improve.append(
+            f"Enable SAR on {', '.join(disabled_sar)} as additional reversal guard")
+
+    # ── 8. Volume conviction ──────────────────────────────────────────────────
+    vol_ratio = _f("vol_ratio")
+    if vol_ratio is not None:
+        if vol_ratio < 1.5:
+            reasons.append(
+                f"Volume spike was only {vol_ratio:.1f}× average — low conviction. "
+                f"Weak volume entries have higher false-signal rate.")
+            improve.append("Raise volume spike minimum to 2.0× average for stronger conviction")
+        elif vol_ratio < 2.0:
+            reasons.append(
+                f"Volume spike was {vol_ratio:.1f}× average — moderate conviction. "
+                f"A 2×+ spike would indicate stronger participation.")
+
+    # ── Fallback if nothing specific was found ────────────────────────────────
+    if not reasons:
+        reasons.append(
+            "All entry filters were healthy — reversal was caused by an external "
+            "market event (macro news, liquidation cascade, or broader market dump) "
+            "that no technical filter can predict.")
+        improve.append(
+            "Consider adding a market-wide sentiment check (e.g. BTC dominance or "
+            "funding rate) to avoid entries during high-volatility macro windows")
+
+    # ── Build output ──────────────────────────────────────────────────────────
+    lines = [f"• {r}" for r in reasons]
+    if improve:
+        lines.append("")
+        lines.append("💡 Improvement suggestions:")
+        lines.extend(f"  → {i}" for i in improve)
+
+    return "\n".join(lines)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config persistence
+# ─────────────────────────────────────────────────────────────────────────────
+# Data is always saved to ~/Documents/CryptoDemoTrades/ — a fixed, reliable
+# location on the user's computer that survives app restarts, script moves,
+# and working-directory changes.  A fallback to the script's own directory is
+# tried first so that running multiple instances from different folders stays
+# independent; the home-Documents path is the final, always-writable fallback.
+
+def _resolve_data_dir() -> pathlib.Path:
+    candidates = []
+    # 1. Same directory as the script (keeps data next to code when writable)
+    try:
+        candidates.append(pathlib.Path(__file__).parent.absolute())
+    except Exception:
+        pass
+    # 2. Stable home-directory location — survives script moves & restarts
+    candidates.append(pathlib.Path.home() / "Documents" / "CryptoDemoTrades")
+
+    for path in candidates:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".write_probe"
+            probe.touch(); probe.unlink()
+            return path          # first writable candidate wins
+        except OSError:
+            continue
+
+    # Last resort: temp dir (data won't survive OS restart — shown in UI)
+    import tempfile
+    fallback = pathlib.Path(tempfile.gettempdir()) / "CryptoDemoTrades"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+_SCRIPT_DIR  = _resolve_data_dir()
+CONFIG_FILE  = _SCRIPT_DIR / "scanner_config.json"
+LOG_FILE     = _SCRIPT_DIR / "scanner_log.json"
+_config_lock = threading.Lock()
+
+def load_config() -> dict:
+    if CONFIG_FILE.exists():
+        try:
+            saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            cfg   = dict(DEFAULT_CONFIG)
+            for k in DEFAULT_CONFIG:
+                if k in saved:
+                    cfg[k] = saved[k]
+            return cfg
+        except Exception:
+            pass
+    return dict(DEFAULT_CONFIG)
+
+def save_config(cfg: dict):
+    with _config_lock:
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+def _migrate_criteria(crit: dict) -> dict:
+    """
+    Convert old-format criteria that stored "✅"/"—" into the new per-timeframe
+    numeric keys.  Values that were "✅" become None (no data available) so the
+    UI shows "—" instead of a stale tick mark.
+    """
+    if not crit:
+        return crit
+    # Migrate flat MACD/SAR/Vol keys → per-timeframe keys
+    if "macd" in crit and "macd_3m" not in crit:
+        v = crit.pop("macd")
+        crit["macd_3m"]  = None if v == "✅" else v
+        crit["macd_5m"]  = None
+        crit["macd_15m"] = None
+    if "sar" in crit and "sar_3m" not in crit:
+        v = crit.pop("sar")
+        crit["sar_3m"]  = None if v == "✅" else v
+        crit["sar_5m"]  = None
+        crit["sar_15m"] = None
+    if "vol" in crit and "vol_ratio" not in crit:
+        v = crit.pop("vol")
+        crit["vol_ratio"] = None if v == "✅" else v
+    # EMA: if stored as "✅" we have no actual value — set to None
+    for key in ("ema_3m", "ema_5m", "ema_15m"):
+        if crit.get(key) == "✅":
+            crit[key] = None
+    return crit
+
+def load_log():
+    if LOG_FILE.exists():
+        try:
+            data = json.loads(LOG_FILE.read_text(encoding="utf-8"))
+            # Migrate any pre-update signals transparently
+            for sig in data.get("signals", []):
+                if "criteria" in sig:
+                    sig["criteria"] = _migrate_criteria(sig["criteria"])
+            return data
+        except Exception:
+            pass
+    return {"health": {"total_cycles": 0, "last_scan_at": None,
+                        "last_scan_duration_s": 0.0, "total_api_errors": 0,
+                        "watchlist_size": 0, "pre_filtered_out": 0,
+                        "deep_scanned": 0},
+            "signals": []}
+
+def save_log(log):
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LOG_FILE.write_text(json.dumps(log, indent=2), encoding="utf-8")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level shared state
+# ─────────────────────────────────────────────────────────────────────────────
+if "_scanner_initialised" not in st.session_state:
+    import builtins
+    if not getattr(builtins, "_binance_scanner_globals_set", False):
+        import builtins as _b
+        _b._binance_scanner_globals_set = True
+        _b._bsc_cfg           = load_config()
+        _b._bsc_log           = load_log()
+        _b._bsc_log_lock      = threading.Lock()
+        _b._bsc_running       = threading.Event()
+        _b._bsc_running.set()
+        _b._bsc_thread        = None
+        _b._bsc_filter_counts = {}
+        _b._bsc_filter_lock   = threading.Lock()
+        _b._bsc_last_error    = ""
+        _b._bsc_rescan_event  = threading.Event()   # set to skip sleep & rescan immediately
+        _b._bsc_sl_paused     = False               # circuit breaker: True when 3 consec SL hit
+        _b._bsc_api_conn_status = {          # result of last "Test Connection" call
+            "status":      "untested",       # "untested" | "ok" | "error"
+            "message":     "",
+            "tested_at":   None,             # Dubai ISO timestamp
+            "demo_mode":   None,
+            "uid":         "",               # OKX account UID on success
+            "pos_mode":    "net_mode",       # "net_mode" | "long_short_mode" (hedge)
+            "acct_lv":     "2",              # OKX account level (1=Simple, 2=Single-margin…)
+        }
+        _b._bsc_last_trade_raw  = {}         # full raw OKX response from last order attempt
+        _b._bsc_error_log       = []         # structured API error log (max 500 entries)
+        _b._bsc_error_log_lock  = threading.Lock()
+        # D — symbol cache (also stores ctVal per symbol for position sizing)
+        _b._bsc_symbol_cache  = {"symbols": [], "fetched_at": 0, "wl_key": "", "ct_val": {}}
+    st.session_state["_scanner_initialised"] = True
+
+import builtins as _b
+_cfg             = _b._bsc_cfg
+_log             = _b._bsc_log
+_log_lock        = _b._bsc_log_lock
+_scanner_running = _b._bsc_running
+_filter_lock     = _b._bsc_filter_lock
+_filter_counts   = _b._bsc_filter_counts
+_rescan_event    = _b._bsc_rescan_event
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP helpers  (+semaphore rate limiter)
+# ─────────────────────────────────────────────────────────────────────────────
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
+    "Accept":          "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_local = threading.local()
+
+def get_session():
+    if not hasattr(_local, "session"):
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        # Increase connection pool to match semaphore concurrency (20 slots).
+        # Default pool_maxsize=10 would cause urllib3 to queue connections,
+        # adding extra latency on top of the network round-trip.
+        from requests.adapters import HTTPAdapter
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=25, max_retries=0)
+        s.mount("https://", adapter)
+        s.mount("http://",  adapter)
+        _local.session = s
+    return _local.session
+
+def safe_get(url, params=None, _retries=4):
+    for attempt in range(_retries):
+        try:
+            _rate_wait()                            # ← token-bucket: max 15 req/s
+            with _api_sem:                          # ← concurrency cap: max 20 in-flight
+                r = get_session().get(url, params=params, timeout=10)  # was 20s
+            if r.status_code == 429:
+                # Cap sleep at 5 s — Retry-After can be up to 30 s which cascades
+                # into 300-second scan times when multiple threads hit it at once.
+                wait = min(int(r.headers.get("Retry-After", 5)), 5)
+                time.sleep(wait); continue
+            if r.status_code in (418, 403, 451):
+                raise RuntimeError(
+                    f"HTTP {r.status_code}: OKX is blocking this server's IP. "
+                    "Try Railway (railway.app) — uses residential IPs.")
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and "code" in data and data["code"] != "0":
+                raise RuntimeError(f"OKX API error {data['code']}: {data.get('msg','')}")
+            return data
+        except requests.exceptions.ConnectionError:
+            if attempt < _retries - 1: time.sleep(1); continue
+            raise
+    msg = f"Failed after {_retries} retries: {url}"
+    _append_error("http", msg, endpoint=url)
+    raise RuntimeError(msg)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Structured API error logger
+# ─────────────────────────────────────────────────────────────────────────────
+_ERROR_LOG_MAX = 500   # rolling cap — oldest entries are dropped beyond this
+
+def _append_error(err_type: str, message: str,
+                  symbol: str = "", endpoint: str = "") -> None:
+    """
+    Append one structured entry to the shared error log.
+
+    err_type : "scan" | "trade" | "loop" | "http"
+    message  : human-readable error string
+    symbol   : coin that triggered the error (empty for non-coin errors)
+    endpoint : OKX API path, if known
+    """
+    entry = {
+        "ts":       dubai_now().isoformat(),
+        "type":     err_type,
+        "symbol":   symbol,
+        "endpoint": endpoint,
+        "message":  message[:400],   # cap length for display
+    }
+    try:
+        lock = getattr(_b, "_bsc_error_log_lock", None)
+        log  = getattr(_b, "_bsc_error_log", None)
+        if lock is None or log is None:
+            return
+        with lock:
+            log.append(entry)
+            if len(log) > _ERROR_LOG_MAX:
+                del log[:len(log) - _ERROR_LOG_MAX]
+    except Exception:
+        pass   # never let the logger itself crash the scanner
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OKX symbol helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _to_okx(sym: str) -> str:
+    return f"{sym[:-4]}-USDT-SWAP" if sym.endswith("USDT") else sym
+
+def _from_okx(inst_id: str) -> str:
+    return inst_id.replace("-USDT-SWAP", "USDT") if inst_id.endswith("-USDT-SWAP") else inst_id
+
+def get_symbols(watchlist: list) -> tuple:
+    """Return (watchlist_symbols_live_on_OKX, ct_val_dict).
+    ct_val_dict maps e.g. 'BTCUSDT' → contract size in base currency (float).
+    """
+    active  = set()
+    ct_vals = {}
+    data    = safe_get(f"{BASE}/api/v5/public/instruments", {"instType": "SWAP"})
+    for s in data.get("data", []):
+        inst_id = s.get("instId", "")
+        if inst_id.endswith("-USDT-SWAP") and s.get("state") == "live":
+            sym = _from_okx(inst_id)
+            active.add(sym)
+            try:
+                _cv = float(s.get("ctVal") or 0)
+                ct_vals[sym] = _cv if _cv > 0 else 0.0
+                # Store 0 on parse failure so _get_ct_val treats it as a cache
+                # miss and forces a re-fetch rather than silently using 1.0.
+            except (TypeError, ValueError):
+                ct_vals[sym] = 0.0
+    skipped = [s for s in watchlist if s not in active]
+    if skipped:
+        print(f"  [Symbol cache] {len(skipped)} watchlist coins not on OKX: {skipped[:5]}...")
+    return [s for s in watchlist if s in active], ct_vals
+
+# ─────────────────────────────────────────────────────────────────────────────
+# D — Cached symbol lookup (refresh every 6 h or on watchlist change)
+# ─────────────────────────────────────────────────────────────────────────────
+def get_symbols_cached(watchlist: list) -> list:
+    now    = time.time()
+    cache  = _b._bsc_symbol_cache
+    wl_key = ",".join(sorted(watchlist))
+    if (not cache["symbols"] or
+            now - cache["fetched_at"] > _SYMBOL_CACHE_TTL or
+            cache["wl_key"] != wl_key):
+        print("[Scanner] Refreshing OKX symbol cache…")
+        syms, ct_vals       = get_symbols(watchlist)
+        cache["symbols"]    = syms
+        cache["ct_val"]     = ct_vals
+        cache["fetched_at"] = now
+        cache["wl_key"]     = wl_key
+    return list(cache["symbols"])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OKX Auto-Trading — authentication + order placement
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _okx_sign(timestamp: str, method: str, request_path: str, body: str, secret: str) -> str:
+    """HMAC-SHA256 signature required by OKX private endpoints."""
+    msg = timestamp + method + request_path + body
+    return base64.b64encode(
+        hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).digest()
+    ).decode()
+
+def _trade_post(path: str, body: dict, cfg: dict) -> dict:
+    """
+    Authenticated POST to an OKX private endpoint.
+    Adds x-simulated-trading: 1 header when demo_mode is True.
+    Uses the same _api_sem semaphore as public calls to respect rate limits.
+    """
+    ts       = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    body_str = json.dumps(body)
+    sign     = _okx_sign(ts, "POST", path, body_str, cfg["api_secret"])
+    headers  = {
+        "OK-ACCESS-KEY":        cfg["api_key"],
+        "OK-ACCESS-SIGN":       sign,
+        "OK-ACCESS-TIMESTAMP":  ts,
+        "OK-ACCESS-PASSPHRASE": cfg["api_passphrase"],
+        "Content-Type":         "application/json",
+    }
+    if cfg.get("demo_mode", True):
+        headers["x-simulated-trading"] = "1"
+    # Merge with session-level headers (User-Agent, Accept, etc.) so auth
+    # headers supplement rather than replace the defaults.
+    sess = get_session()
+    merged = {**dict(sess.headers), **headers}
+    with _api_sem:
+        r = sess.post(f"{BASE}{path}", headers=merged,
+                      data=body_str, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def _trade_get(path: str, params: dict, cfg: dict) -> dict:
+    """Authenticated GET to an OKX private endpoint."""
+    qs  = ("?" + "&".join(f"{k}={v}" for k, v in params.items())) if params else ""
+    ts  = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    sign = _okx_sign(ts, "GET", path + qs, "", cfg["api_secret"])
+    headers = {
+        "OK-ACCESS-KEY":        cfg["api_key"],
+        "OK-ACCESS-SIGN":       sign,
+        "OK-ACCESS-TIMESTAMP":  ts,
+        "OK-ACCESS-PASSPHRASE": cfg["api_passphrase"],
+        "Content-Type":         "application/json",
+    }
+    if cfg.get("demo_mode", True):
+        headers["x-simulated-trading"] = "1"
+    # Merge with session-level headers (User-Agent, Accept, etc.) so auth
+    # headers supplement rather than replace the defaults.
+    sess = get_session()
+    merged = {**dict(sess.headers), **headers}
+    with _api_sem:
+        r = sess.get(f"{BASE}{path}", params=params,
+                     headers=merged, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def test_api_connection(cfg: dict) -> dict:
+    """
+    Verify OKX API credentials by calling GET /api/v5/account/balance and
+    GET /api/v5/account/config.
+
+    Also detects the account's position mode (net_mode vs long_short_mode) which
+    controls whether posSide must be included in trade orders.
+
+    Returns {"status":"ok"|"error", "message":str, "uid":str, "pos_mode":str}.
+    """
+    if not cfg.get("api_key") or not cfg.get("api_secret") or not cfg.get("api_passphrase"):
+        return {"status": "error", "message": "API credentials are incomplete.",
+                "uid": "", "pos_mode": "net_mode"}
+    try:
+        # 1 — balance check
+        resp = _trade_get("/api/v5/account/balance", {}, cfg)
+        if resp.get("code") != "0":
+            msg = f"OKX error {resp.get('code')}: {resp.get('msg', 'unknown')}"
+            return {"status": "error", "message": msg, "uid": "", "pos_mode": "net_mode"}
+
+        details  = resp.get("data", [{}])[0]
+        total_eq = details.get("totalEq", "0")
+
+        # 2 — account config: UID + position mode
+        cfg_resp = _trade_get("/api/v5/account/config", {}, cfg)
+        uid      = ""
+        pos_mode = "net_mode"
+        acct_lv  = "2"   # assume single-currency margin if unknown
+        if cfg_resp.get("code") == "0":
+            acct     = cfg_resp.get("data", [{}])[0]
+            uid      = acct.get("uid", "")
+            pos_mode = acct.get("posMode", "net_mode")
+            acct_lv  = str(acct.get("acctLv", "2"))
+
+        # acctLv "1" = Simple mode — SWAP trading not allowed
+        _ACCT_MODE_LABELS = {
+            "1": "Simple (⚠️ SWAP disabled)",
+            "2": "Single-currency margin",
+            "3": "Multi-currency margin",
+            "4": "Portfolio margin",
+        }
+        acct_lv_label = _ACCT_MODE_LABELS.get(acct_lv, f"Level {acct_lv}")
+
+        env      = "Demo" if cfg.get("demo_mode", True) else "Live"
+        pm_label = "Hedge (Long/Short)" if pos_mode == "long_short_mode" else "Net"
+        try:
+            eq_str = f"{float(total_eq):,.2f}"
+        except (ValueError, TypeError):
+            eq_str = total_eq
+
+        if acct_lv == "1":
+            # Connected but cannot trade — return as error with clear instructions
+            msg = (
+                f"Connected ({env}) but account is in Simple mode — "
+                "SWAP trading is disabled.\n\n"
+                "Fix: OKX Demo → avatar (top-right) → Account mode → "
+                "switch to 'Single-currency margin' or higher."
+            )
+            return {"status": "error", "message": msg, "uid": uid,
+                    "pos_mode": pos_mode, "acct_lv": acct_lv}
+
+        msg = (
+            f"Connected ({env}) · {acct_lv_label} · "
+            f"Equity: {eq_str} USDT · Pos mode: {pm_label}"
+        )
+        return {"status": "ok", "message": msg, "uid": uid,
+                "pos_mode": pos_mode, "acct_lv": acct_lv}
+
+    except Exception as exc:
+        return {"status": "error", "message": str(exc), "uid": "", "pos_mode": "net_mode"}
+
+def _get_ct_val(sym: str) -> float:
+    """
+    Return contract size (ctVal) for a symbol.
+    Uses the symbol cache populated at each scan cycle.
+    Falls back to a live API call if the cache is cold.
+
+    IMPORTANT: Never falls back to 1.0.  If ctVal cannot be confirmed from
+    OKX, raises ValueError so the caller can refuse the order.  Using 1.0 as
+    a fallback for a token whose real ctVal is e.g. 10 would send 10× the
+    intended position size.
+    """
+    ct = _b._bsc_symbol_cache.get("ct_val", {}).get(sym)
+    if ct and ct > 0:
+        return ct
+    # Cache miss — fetch on-demand (rare, e.g. first run before any scan)
+    try:
+        data = safe_get(f"{BASE}/api/v5/public/instruments",
+                        {"instType": "SWAP", "instId": _to_okx(sym)})
+        for s in data.get("data", []):
+            raw = s.get("ctVal", "")
+            val = float(raw) if raw not in ("", None) else 0.0
+            if val > 0:
+                _b._bsc_symbol_cache.setdefault("ct_val", {})[sym] = val
+                _append_error("info",
+                    f"ctVal for {_to_okx(sym)} fetched on-demand: {val} "
+                    f"(cache was cold — populated now)")
+                return val
+    except Exception as _e:
+        raise ValueError(
+            f"ctVal for {_to_okx(sym)} could not be fetched from OKX "
+            f"({_e}) — order refused to prevent wrong position sizing"
+        ) from _e
+    raise ValueError(
+        f"ctVal for {_to_okx(sym)} not found in OKX instruments response "
+        f"— order refused to prevent wrong position sizing"
+    )
+
+def _set_leverage_okx(sym: str, cfg: dict) -> None:
+    """Set leverage for a symbol before placing an order."""
+    lev = str(min(int(cfg.get("trade_leverage", 10)), get_max_leverage(sym)))
+    _trade_post("/api/v5/account/set-leverage", {
+        "instId":  _to_okx(sym),
+        "lever":   lev,
+        "mgnMode": cfg.get("trade_margin_mode", "cross"),
+    }, cfg)
+
+_OKX_KNOWN_ERRORS = {
+    "51010": (
+        "Account is in Simple mode — SWAP trading is disabled. "
+        "Fix: OKX Demo → top-right avatar → Account mode → switch to "
+        "'Single-currency margin' (or higher), then re-test."
+    ),
+    "51000": "Parameter error — check instId, tdMode, or sz.",
+    "51001": ("Instrument doesn't exist on OKX — coin may be delisted. "
+              "Remove it from your watchlist."),
+    "51006": "Order price out of limit.",
+    "51008": "Insufficient balance.",
+    "51020": "Order quantity below minimum.",
+    "58001": "Invalid API key — check credentials.",
+    "50111": "Invalid API key.",
+    "50100": "API frozen — IP or permissions issue.",
+}
+
+def _okx_err(resp: dict) -> str:
+    """Extract the most specific error string from an OKX response dict."""
+    top   = f"OKX {resp.get('code','?')}: {resp.get('msg','unknown')}"
+    items = resp.get("data") or []
+    if items:
+        d = items[0]
+        s_code = d.get("sCode", "")
+        s_msg  = d.get("sMsg", "").strip()
+        if s_code and s_code not in ("", "0"):
+            friendly = _OKX_KNOWN_ERRORS.get(s_code)
+            detail   = friendly if friendly else (s_msg or s_code)
+            return f"[{s_code}] {detail}"
+    return top
+
+def place_okx_order(sig: dict, cfg: dict) -> dict:
+    """
+    Place a market LONG order on OKX (demo or live), then immediately place a
+    separate OCO algo order (TP + SL in one call) via /api/v5/trade/order-algo.
+
+    Two-step design avoids the 'All operations failed' error that occurs when
+    attachAlgoOrds in the entry order fails validation on the exchange side.
+
+    Position sizing:
+        notional   = trade_usdt_amount × leverage
+        contracts  = floor(notional / (ctVal × entry_price))   ← minimum 1
+
+    Returns a result dict:
+        {"ordId": str, "algoId": str, "sz": int,
+         "status": "placed"|"partial"|"error", "error": str}
+        status="partial" means the entry order placed but the OCO algo failed.
+    """
+    try:
+        sym    = sig["symbol"]
+        entry  = float(sig["entry"])
+        tp     = float(sig["tp"])
+        sl     = float(sig["sl"])
+        usdt   = float(cfg.get("trade_usdt_amount", 10))
+        lev    = min(int(cfg.get("trade_leverage", 10)), get_max_leverage(sym))
+        mode   = cfg.get("trade_margin_mode", "cross")
+
+        # ── Pre-trade instrument validation ───────────────────────────────────
+        # A coin can appear in signals even after being delisted from OKX SWAP
+        # markets because historical candle data stays accessible. The ct_val
+        # cache is populated from the live instruments endpoint (state=live), so
+        # if a symbol is absent from that cache the SWAP instrument doesn't exist
+        # and OKX will return sCode 51001 (instrument not found).
+        ct_cache = _b._bsc_symbol_cache.get("ct_val", {})
+        if ct_cache and sym not in ct_cache:
+            err = (f"Instrument {_to_okx(sym)} not found in OKX live SWAP list — "
+                   f"may be delisted. Remove {sym} from watchlist.")
+            _append_error("trade", err, symbol=sym)
+            return {"ordId": "", "algoId": "", "sz": 0, "status": "error", "error": err}
+
+        try:
+            ct_val = _get_ct_val(sym)
+        except ValueError as _ctv_err:
+            _err = str(_ctv_err)
+            _append_error("trade", _err, symbol=sym)
+            return {"ordId": "", "algoId": "", "sz": 0, "status": "error",
+                    "error": _err,
+                    "ct_val": 0, "notional": 0, "tdMode": mode, "is_hedge": False}
+        notional  = usdt * lev
+        _base_info = {"ct_val": ct_val, "notional": notional,
+                      "tdMode": mode, "is_hedge": False}
+        if ct_val <= 0 or entry <= 0:
+            return {"ordId": "", "algoId": "", "sz": 0, "status": "error",
+                    "error": f"Bad ct_val ({ct_val}) or entry ({entry}) — cannot size position",
+                    **_base_info}
+        raw_contracts = notional / (ct_val * entry)
+        contracts     = max(1, int(raw_contracts))
+        # Guard against absurdly large values (e.g. micro-priced tokens with wrong ct_val)
+        if contracts > 100_000:
+            return {"ordId": "", "algoId": "", "sz": contracts, "status": "error",
+                    "error": (f"Contract count too large ({contracts}) — "
+                              f"ct_val={ct_val}, entry={entry}, notional={notional}. "
+                              f"Check ctVal for {sym}."),
+                    **_base_info}
+
+        # ── Fetch position mode LIVE from OKX (not from cached conn status) ──
+        # Caching pos_mode is unreliable: builtins reset on process restart and
+        # the user may not click Test Connection before the first signal fires.
+        is_hedge = False
+        try:
+            _pm_resp = _trade_get("/api/v5/account/config", {}, cfg)
+            if _pm_resp.get("code") == "0":
+                _pm = _pm_resp.get("data", [{}])[0].get("posMode", "net_mode")
+                is_hedge = (_pm == "long_short_mode")
+                # Keep the UI conn status in sync too
+                _cs = getattr(_b, "_bsc_api_conn_status", None)
+                if _cs is not None:
+                    _cs["pos_mode"] = _pm
+        except Exception as _pm_exc:
+            # Fall back to whatever was last cached
+            is_hedge = (getattr(_b, "_bsc_api_conn_status", {})
+                        .get("pos_mode", "net_mode") == "long_short_mode")
+            _append_error("trade", f"posMode fetch failed: {_pm_exc}",
+                          symbol=sym, endpoint="/api/v5/account/config")
+        _base_info["is_hedge"] = is_hedge
+
+        # ── Step 1: Set leverage ──────────────────────────────────────────────
+        try:
+            _set_leverage_okx(sym, cfg)
+        except Exception as lev_exc:
+            _append_error("trade", f"set-leverage warning: {lev_exc}",
+                          symbol=sym, endpoint="/api/v5/account/set-leverage")
+
+        # ── Step 2: Place clean market buy ───────────────────────────────────
+        order_body: dict = {
+            "instId":  _to_okx(sym),
+            "tdMode":  mode,
+            "side":    "buy",
+            "ordType": "market",
+            "sz":      str(contracts),
+        }
+        if is_hedge:
+            order_body["posSide"] = "long"   # required in Long/Short (hedge) mode
+
+        resp   = _trade_post("/api/v5/trade/order", order_body, cfg)
+        # Store full raw response for debugging (visible in UI)
+        _b._bsc_last_trade_raw = {
+            "endpoint":    "/api/v5/trade/order",
+            "body_sent":   order_body,
+            "response":    resp,
+            "is_hedge":    is_hedge,
+            "contracts":   contracts,
+            "ct_val":      ct_val,
+        }
+        d0     = (resp.get("data") or [{}])[0]
+        ord_id = d0.get("ordId", "")
+
+        if resp.get("code") != "0":
+            err = _okx_err(resp)
+            _append_error("trade",
+                          f"{err} | body={json.dumps(order_body)} | resp={json.dumps(resp)[:300]}",
+                          symbol=sym, endpoint="/api/v5/trade/order")
+            return {"ordId": "", "algoId": "", "sz": contracts,
+                    "status": "error", "error": err, **_base_info}
+        if d0.get("sCode", "0") != "0":
+            err = f"Entry order: {d0.get('sCode')}: {d0.get('sMsg','')}"
+            _append_error("trade",
+                          f"{err} | body={json.dumps(order_body)}",
+                          symbol=sym, endpoint="/api/v5/trade/order")
+            return {"ordId": ord_id, "algoId": "", "sz": contracts,
+                    "status": "error", "error": err, **_base_info}
+
+        # ── Step 3: Fetch actual fill price (avgPx) ───────────────────────────
+        # Market orders fill at the live market price, which differs from the
+        # signal's entry price (captured up to loop_minutes ago).
+        # We must recalculate TP and SL from the real fill price so the
+        # percentage targets match what the user configured.
+        actual_entry = entry   # fallback to signal entry if fetch fails
+        time.sleep(0.3)        # brief pause — give OKX time to record the fill
+        try:
+            fill_resp = _trade_get(
+                "/api/v5/trade/order",
+                {"instId": _to_okx(sym), "ordId": ord_id},
+                cfg)
+            if fill_resp.get("code") == "0":
+                fill_d = fill_resp.get("data", [{}])[0]
+                avg_px = float(fill_d.get("avgPx", 0) or 0)
+                if avg_px > 0:
+                    actual_entry = avg_px
+        except Exception as fill_exc:
+            _append_error("trade",
+                          f"Could not fetch fill price, using signal entry: {fill_exc}",
+                          symbol=sym, endpoint="/api/v5/trade/order[GET]")
+
+        # Recalculate TP and SL from the actual fill price.
+        # Isolated mode: SL = liquidation price (entry × (1 − 1/leverage)).
+        # Cross mode:    SL = entry × (1 − sl_pct%).
+        tp_pct    = float(cfg.get("tp_pct", 1.5)) / 100
+        actual_tp = _pround(actual_entry * (1 + tp_pct))
+        if mode == "isolated":
+            actual_sl = _pround(actual_entry * (1 - 1 / lev))
+        else:
+            sl_pct    = float(cfg.get("sl_pct", 3.0)) / 100
+            actual_sl = _pround(actual_entry * (1 - sl_pct))
+
+        # ── Step 4: Place OCO algo (TP + SL) using actual fill price ─────────
+        # In hedge mode, closing a long requires posSide="long" on the sell too.
+        algo_body: dict = {
+            "instId":       _to_okx(sym),
+            "tdMode":       mode,
+            "side":         "sell",
+            "ordType":      "oco",
+            "sz":           str(contracts),
+            "tpTriggerPx":  str(actual_tp),
+            "tpOrdPx":      "-1",    # market fill when TP triggers
+            "slTriggerPx":  str(actual_sl),
+            "slOrdPx":      "-1",    # market fill when SL triggers
+        }
+        if is_hedge:
+            algo_body["posSide"] = "long"    # closing a long in hedge mode
+        algo_resp = _trade_post("/api/v5/trade/order-algo", algo_body, cfg)
+        ad        = (algo_resp.get("data") or [{}])[0]
+        algo_id   = ad.get("algoId", "")
+
+        if algo_resp.get("code") != "0" or (ad.get("sCode","0") != "0" and ad.get("sCode","")):
+            algo_err = _okx_err(algo_resp) if algo_resp.get("code") != "0" \
+                       else f"OCO algo: {ad.get('sCode')}: {ad.get('sMsg','')}"
+            _append_error("trade", f"OCO algo failed (entry placed): {algo_err}",
+                          symbol=sym, endpoint="/api/v5/trade/order-algo")
+            return {"ordId": ord_id, "algoId": "", "sz": contracts,
+                    "status": "partial", "error": f"Entry ✅ · TP/SL ❌ {algo_err}",
+                    "actual_entry": actual_entry,
+                    "actual_tp": actual_tp, "actual_sl": actual_sl,
+                    **_base_info}
+
+        return {"ordId": ord_id, "algoId": algo_id, "sz": contracts,
+                "status": "placed", "error": "",
+                "actual_entry": actual_entry,
+                "actual_tp": actual_tp, "actual_sl": actual_sl,
+                **_base_info}
+
+    except Exception as exc:
+        _append_error("trade", str(exc), symbol=sig.get("symbol", ""),
+                      endpoint="/api/v5/trade/order")
+        return {"ordId": "", "algoId": "", "sz": 0,
+                "status": "error", "error": str(exc)}
+
+def place_okx_manual_order(sym: str, entry: float, tp: float, sl: float,
+                           cfg: dict) -> dict:
+    """
+    Place a manually specified order:
+      • entry > 0  → LIMIT buy at exactly that price, TP/SL used as-is
+      • entry == 0 → MARKET buy at live price, TP/SL used as-is (no recalc)
+
+    Unlike place_okx_order (auto-trading), this function never recalculates
+    TP or SL — the user's values are sent directly to OKX.
+
+    Returns {"ordId", "algoId", "sz", "status", "error",
+             "actual_entry", "actual_tp", "actual_sl"}
+    """
+    try:
+        usdt   = float(cfg.get("trade_usdt_amount", 10))
+        lev    = min(int(cfg.get("trade_leverage", 10)), get_max_leverage(sym))
+        mode   = cfg.get("trade_margin_mode", "cross")
+
+        # Pre-trade instrument check
+        ct_cache = _b._bsc_symbol_cache.get("ct_val", {})
+        if ct_cache and sym not in ct_cache:
+            err = f"Instrument {_to_okx(sym)} not found in OKX live SWAP list."
+            _append_error("trade", err, symbol=sym)
+            return {"ordId": "", "algoId": "", "sz": 0,
+                    "status": "error", "error": err}
+
+        try:
+            ct_val = _get_ct_val(sym)
+        except ValueError as _ctv_err:
+            _err = str(_ctv_err)
+            _append_error("trade", _err, symbol=sym)
+            return {"ordId": "", "algoId": "", "sz": 0, "status": "error", "error": _err}
+        ref_price = entry if entry > 0 else None
+
+        # If no entry price given, fetch live market price for sizing
+        if ref_price is None:
+            try:
+                tick = safe_get(f"{BASE}/api/v5/market/ticker",
+                                {"instId": _to_okx(sym)})
+                ref_price = float(tick.get("data", [{}])[0].get("last", 0) or 0)
+            except Exception:
+                pass
+        if not ref_price or ref_price <= 0:
+            return {"ordId": "", "algoId": "", "sz": 0, "status": "error",
+                    "error": "Could not determine price for contract sizing."}
+
+        contracts = max(1, int((usdt * lev) / (ct_val * ref_price)))
+
+        # Position mode
+        is_hedge = False
+        try:
+            _pm_resp = _trade_get("/api/v5/account/config", {}, cfg)
+            if _pm_resp.get("code") == "0":
+                _pm      = _pm_resp.get("data", [{}])[0].get("posMode", "net_mode")
+                is_hedge = (_pm == "long_short_mode")
+                _cs = getattr(_b, "_bsc_api_conn_status", None)
+                if _cs is not None:
+                    _cs["pos_mode"] = _pm
+        except Exception:
+            is_hedge = (getattr(_b, "_bsc_api_conn_status", {})
+                        .get("pos_mode", "net_mode") == "long_short_mode")
+
+        # Set leverage
+        try:
+            _set_leverage_okx(sym, cfg)
+        except Exception as lev_exc:
+            _append_error("trade", f"set-leverage warning: {lev_exc}", symbol=sym)
+
+        # ── Build order body ──────────────────────────────────────────────────
+        # LIMIT: embed TP/SL via attachAlgoOrds in the same request.
+        #   OKX activates the algo when the limit order fills — no race condition.
+        # MARKET: two-step (entry → OCO), same as auto-trading.
+        if entry > 0:
+            # LIMIT order with TP/SL attached inline
+            order_body: dict = {
+                "instId":  _to_okx(sym),
+                "tdMode":  mode,
+                "side":    "buy",
+                "ordType": "limit",
+                "px":      str(_pround(entry)),
+                "sz":      str(contracts),
+                "attachAlgoOrds": [{
+                    "attachAlgoClOrdId": str(uuid.uuid4()).replace("-","")[:24],
+                    "tpTriggerPx":       str(_pround(tp)),
+                    "tpOrdPx":           "-1",
+                    "slTriggerPx":       str(_pround(sl)),
+                    "slOrdPx":           "-1",
+                }],
+            }
+            if is_hedge:
+                order_body["posSide"] = "long"
+
+            resp   = _trade_post("/api/v5/trade/order", order_body, cfg)
+            _b._bsc_last_trade_raw = {
+                "endpoint":  "/api/v5/trade/order (LIMIT + attachAlgoOrds)",
+                "body_sent": order_body,
+                "response":  resp,
+                "is_hedge":  is_hedge,
+                "contracts": contracts,
+                "ct_val":    ct_val,
+            }
+            d0     = (resp.get("data") or [{}])[0]
+            ord_id = d0.get("ordId", "")
+
+            if resp.get("code") != "0":
+                err = _okx_err(resp)
+                _append_error("trade",
+                              f"{err} | body={json.dumps(order_body)} | resp={json.dumps(resp)[:300]}",
+                              symbol=sym, endpoint="/api/v5/trade/order")
+                return {"ordId": "", "algoId": "", "sz": contracts,
+                        "status": "error", "error": err}
+            if d0.get("sCode", "0") != "0":
+                err = f"Limit order: {d0.get('sCode')}: {d0.get('sMsg','')}"
+                _append_error("trade", f"{err} | body={json.dumps(order_body)}",
+                              symbol=sym, endpoint="/api/v5/trade/order")
+                return {"ordId": ord_id, "algoId": "", "sz": contracts,
+                        "status": "error", "error": err}
+
+            return {"ordId": ord_id, "algoId": "", "sz": contracts,
+                    "status": "placed", "error": "",
+                    "actual_entry": entry, "actual_tp": tp, "actual_sl": sl}
+
+        else:
+            # MARKET order — two-step: entry then OCO
+            order_body = {
+                "instId":  _to_okx(sym),
+                "tdMode":  mode,
+                "side":    "buy",
+                "ordType": "market",
+                "sz":      str(contracts),
+            }
+            if is_hedge:
+                order_body["posSide"] = "long"
+
+            resp   = _trade_post("/api/v5/trade/order", order_body, cfg)
+            _b._bsc_last_trade_raw = {
+                "endpoint":  "/api/v5/trade/order (MARKET)",
+                "body_sent": order_body,
+                "response":  resp,
+                "is_hedge":  is_hedge,
+                "contracts": contracts,
+                "ct_val":    ct_val,
+            }
+            d0     = (resp.get("data") or [{}])[0]
+            ord_id = d0.get("ordId", "")
+
+            if resp.get("code") != "0":
+                err = _okx_err(resp)
+                _append_error("trade",
+                              f"{err} | body={json.dumps(order_body)} | resp={json.dumps(resp)[:300]}",
+                              symbol=sym, endpoint="/api/v5/trade/order")
+                return {"ordId": "", "algoId": "", "sz": contracts,
+                        "status": "error", "error": err}
+            if d0.get("sCode", "0") != "0":
+                err = f"Market order: {d0.get('sCode')}: {d0.get('sMsg','')}"
+                _append_error("trade", f"{err} | body={json.dumps(order_body)}",
+                              symbol=sym, endpoint="/api/v5/trade/order")
+                return {"ordId": ord_id, "algoId": "", "sz": contracts,
+                        "status": "error", "error": err}
+
+            # OCO with user-specified TP/SL (no recalculation for manual orders)
+            algo_body: dict = {
+                "instId":      _to_okx(sym),
+                "tdMode":      mode,
+                "side":        "sell",
+                "ordType":     "oco",
+                "sz":          str(contracts),
+                "tpTriggerPx": str(_pround(tp)),
+                "tpOrdPx":     "-1",
+                "slTriggerPx": str(_pround(sl)),
+                "slOrdPx":     "-1",
+            }
+            if is_hedge:
+                algo_body["posSide"] = "long"
+
+            algo_resp = _trade_post("/api/v5/trade/order-algo", algo_body, cfg)
+            _b._bsc_last_trade_raw["algo_body_sent"] = algo_body
+            _b._bsc_last_trade_raw["algo_response"]  = algo_resp
+            ad      = (algo_resp.get("data") or [{}])[0]
+            algo_id = ad.get("algoId", "")
+
+            if algo_resp.get("code") != "0" or (ad.get("sCode","0") != "0" and ad.get("sCode","")):
+                algo_err = _okx_err(algo_resp) if algo_resp.get("code") != "0" \
+                           else f"OCO: {ad.get('sCode')}: {ad.get('sMsg','')}"
+                _append_error("trade", f"OCO algo failed: {algo_err}",
+                              symbol=sym, endpoint="/api/v5/trade/order-algo")
+                return {"ordId": ord_id, "algoId": "", "sz": contracts,
+                        "status": "partial",
+                        "error": f"Entry ✅ · TP/SL ❌ {algo_err}",
+                        "actual_entry": 0, "actual_tp": tp, "actual_sl": sl}
+
+            return {"ordId": ord_id, "algoId": algo_id, "sz": contracts,
+                    "status": "placed", "error": "",
+                    "actual_entry": 0, "actual_tp": tp, "actual_sl": sl}
+
+    except Exception as exc:
+        _append_error("trade", str(exc), symbol=sym, endpoint="/api/v5/trade/order")
+        return {"ordId": "", "algoId": "", "sz": 0,
+                "status": "error", "error": str(exc)}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A — Bulk ticker fetch + pre-filter (single API call)
+# ─────────────────────────────────────────────────────────────────────────────
+def get_bulk_tickers() -> dict:
+    """
+    ONE API call → dict {BTCUSDT: {last, open24h, high24h, low24h, volCcy24h}}
+    for every USDT-SWAP pair on OKX.
+    """
+    data   = safe_get(f"{BASE}/api/v5/market/tickers", {"instType": "SWAP"})
+    result = {}
+    for t in data.get("data", []):
+        inst_id = t.get("instId", "")
+        if not inst_id.endswith("-USDT-SWAP"):
+            continue
+        sym = _from_okx(inst_id)
+        try:
+            result[sym] = {
+                "last":      float(t.get("last",      0) or 0),
+                "open24h":   float(t.get("open24h",   0) or 0),
+                "high24h":   float(t.get("high24h",   0) or 0),
+                "low24h":    float(t.get("low24h",    0) or 0),
+                "volCcy24h": float(t.get("volCcy24h", 0) or 0),
+            }
+        except Exception:
+            pass
+    return result
+
+def pre_filter_by_ticker(symbols: list, tickers: dict) -> list:
+    """
+    Zero extra API calls — uses data already in the bulk ticker snapshot.
+
+    Keeps a coin only when:
+      1. 24 h USDT volume ≥ PRE_FILTER_MIN_VOL_USDT  (liquid market)
+      2. Last price ≥ 24 h low × PRE_FILTER_LOW_BUFFER (off the lows)
+    """
+    kept = []
+    for sym in symbols:
+        t = tickers.get(sym)
+        if not t:
+            continue
+        last     = t["last"]
+        low24h   = t["low24h"]
+        vol_usdt = t["volCcy24h"]
+
+        if vol_usdt < PRE_FILTER_MIN_VOL_USDT:
+            continue
+
+        if low24h > 0 and last < low24h * PRE_FILTER_LOW_BUFFER:
+            continue
+
+        kept.append(sym)
+    return kept
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Candle fetch
+# ─────────────────────────────────────────────────────────────────────────────
+def get_klines(sym: str, interval: str, limit: int) -> list:
+    okx_iv  = OKX_INTERVALS.get(interval, interval)
+    inst_id = _to_okx(sym)
+    all_bars: list = []
+    after = None
+    while len(all_bars) < limit:
+        batch  = min(300, limit - len(all_bars))
+        params = {"instId": inst_id, "bar": okx_iv, "limit": batch}
+        if after:
+            params["after"] = after
+        data = safe_get(f"{BASE}/api/v5/market/candles", params)
+        bars = data.get("data", [])
+        if not bars: break
+        all_bars.extend(bars)
+        after = bars[-1][0]
+        if len(bars) < batch: break
+    all_bars.reverse()
+    return [{"time": int(b[0]), "open": float(b[1]), "high": float(b[2]),
+             "low":  float(b[3]), "close": float(b[4]), "volume": float(b[5])}
+            for b in all_bars]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Technical indicators
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pround(x, sig=6):
+    """Round price to `sig` significant figures — handles micro-priced tokens.
+    Prevents ultra-low prices (e.g. SATS at 0.000000003) from rounding to 0."""
+    try:
+        x = float(x)
+        if x == 0:
+            return 0.0
+        magnitude = math.floor(math.log10(abs(x)))
+        decimals  = max(2, sig - int(magnitude))
+        return round(x, decimals)
+    except Exception:
+        return x
+
+def calc_rsi_series(closes, period=14):
+    if len(closes) < period + 2: return []
+    deltas = [closes[i]-closes[i-1] for i in range(1, len(closes))]
+    gains  = [max(d, 0.) for d in deltas]
+    losses = [max(-d, 0.) for d in deltas]
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
+    rsi = [100. if al == 0 else 100 - 100 / (1 + ag / al)]
+    for i in range(period, len(deltas)):
+        ag = (ag*(period-1)+gains[i])/period
+        al = (al*(period-1)+losses[i])/period
+        rsi.append(100. if al == 0 else 100 - 100/(1+ag/al))
+    return rsi
+
+def calc_ema(values: list, period: int) -> list:
+    if len(values) < period: return []
+    k      = 2.0 / (period + 1)
+    result = [sum(values[:period]) / period]
+    for v in values[period:]:
+        result.append(v * k + result[-1] * (1 - k))
+    return result
+
+def calc_macd(closes: list, fast=12, slow=26, signal_period=9):
+    if len(closes) < slow + signal_period: return [], [], []
+    ema_f = calc_ema(closes, fast)
+    ema_s = calc_ema(closes, slow)
+    trim  = len(ema_f) - len(ema_s)
+    ema_f = ema_f[trim:]
+    macd_line = [f-s for f,s in zip(ema_f, ema_s)]
+    if len(macd_line) < signal_period: return [], [], []
+    sig_line     = calc_ema(macd_line, signal_period)
+    trim2        = len(macd_line) - len(sig_line)
+    macd_aligned = macd_line[trim2:]
+    histogram    = [m-s for m,s in zip(macd_aligned, sig_line)]
+    return macd_aligned, sig_line, histogram
+
+def macd_bullish(closes: list, crossover_lookback: int = 12) -> bool:
+    """
+    True when (all on given closes):
+      1. MACD line > 0
+      2. Signal line > 0
+      3. Histogram > 0 AND increasing  ← dark green only
+      4. Bullish crossover within last crossover_lookback candles
+    """
+    macd_line, sig_line, histogram = calc_macd(closes)
+    if not histogram or len(histogram) < 2: return False
+    if macd_line[-1] <= 0 or sig_line[-1] <= 0: return False
+    if histogram[-1] <= 0 or histogram[-1] <= histogram[-2]: return False
+    n = min(crossover_lookback + 1, len(macd_line))
+    for i in range(1, n):
+        prev, curr = -(i+1), -i
+        if (len(macd_line)+prev >= 0 and
+                macd_line[prev] <= sig_line[prev] and
+                macd_line[curr] >  sig_line[curr]):
+            return True
+    return False
+
+def calc_parabolic_sar(candles: list, af_start=0.02, af_step=0.02, af_max=0.20):
+    if not candles: return []
+    if len(candles) < 2: return [(candles[0]["close"], True)]
+    highs  = [c["high"]  for c in candles]
+    lows   = [c["low"]   for c in candles]
+    closes = [c["close"] for c in candles]
+    bullish = closes[1] >= closes[0]
+    ep, sar, af = (highs[0], lows[0], af_start) if bullish else (lows[0], highs[0], af_start)
+    result = [(sar, bullish)]
+    for i in range(1, len(candles)):
+        new_sar = sar + af*(ep-sar)
+        if bullish:
+            new_sar = min(new_sar, lows[i-1])
+            if i >= 2: new_sar = min(new_sar, lows[i-2])
+            if lows[i] < new_sar:
+                bullish, new_sar, ep, af = False, ep, lows[i], af_start
+            else:
+                if highs[i] > ep: ep = highs[i]; af = min(af+af_step, af_max)
+        else:
+            new_sar = max(new_sar, highs[i-1])
+            if i >= 2: new_sar = max(new_sar, highs[i-2])
+            if highs[i] > new_sar:
+                bullish, new_sar, ep, af = True, ep, highs[i], af_start
+            else:
+                if lows[i] < ep: ep = lows[i]; af = min(af+af_step, af_max)
+        sar = new_sar
+        result.append((sar, bullish))
+    return result
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F12 — Premium / Discount / Equilibrium zone  (DZSAFM Pine Script logic)
+# ─────────────────────────────────────────────────────────────────────────────
+def calc_pdz_zone(candles: list, price: float) -> tuple:
+    """
+    Compute Smart Money Premium/Discount/Equilibrium zones from up to the last
+    50 candles on a given timeframe (mirrors the DZSAFM TradingView indicator exactly).
+
+    Zone boundaries  (H = swing high, L = swing low over last 50 candles):
+      Premium zone    : price >= 0.95·H + 0.05·L     ← top 5% of range
+      Equilibrium zone: 0.475·H+0.525·L ≤ price ≤ 0.525·H+0.475·L
+      Discount zone   : price ≤ 0.05·H + 0.95·L      ← bottom 5% of range
+
+    Qualification logic (LONG trades only):
+      • Discount zone                         → QUALIFIES  (greatest room to pump)
+      • Equilibrium zone                      → REJECTED   (indecision, risky)
+      • Premium zone                          → REJECTED   (no upward room)
+      • Band A (equil_top < price < prem_bot) → QUALIFIES if room ≥ 1.5 %
+      • Band B (disc_top  < price < equil_bot)→ QUALIFIES if room ≥ 1.5 %
+
+    Returns (qualifies: bool, zone_label: str)
+    """
+    if not candles or len(candles) < 2:
+        return True, "unknown"
+
+    lookback = candles[-290:]  # 290 candles — 1 OKX API call (~72 hrs on 15m, ~24 hrs on 5m)
+    H = max(c["high"] for c in lookback)
+    L = min(c["low"]  for c in lookback)
+
+    if H <= L:
+        return True, "unknown"
+
+    # Boundary levels  (exact Pine Script maths from DZSAFM)
+    premium_bottom = 0.95 * H + 0.05 * L    # bottom edge of Premium zone
+    equil_top      = 0.525 * H + 0.475 * L  # top edge of Equilibrium zone
+    equil_bottom   = 0.475 * H + 0.525 * L  # bottom edge of Equilibrium zone
+    discount_top   = 0.05  * H + 0.95  * L  # top edge of Discount zone
+
+    band_a_ceil = premium_bottom * (1 - 0.015)   # 1.5% below Premium boundary
+    band_b_ceil = equil_bottom   * (1 - 0.015)   # 1.5% below Equilibrium boundary
+
+    if price <= discount_top:
+        # Fully inside Discount zone — best long setup
+        return True, "Discount"
+    elif price >= premium_bottom:
+        # Fully inside Premium zone — no upward room
+        return False, "Premium"
+    elif equil_bottom <= price <= equil_top:
+        # Equilibrium band — can go either way, skip
+        return False, "Equilibrium"
+    elif equil_top < price < premium_bottom:
+        # Band A: qualifies only if price is at least 1.5% below the Premium boundary
+        dist_pct = (premium_bottom - price) / premium_bottom * 100
+        label    = f"BandA({dist_pct:.1f}%\u2193Prem)"
+        return (price <= band_a_ceil), label
+    else:
+        # Band B: qualifies only if price is at least 1.5% below the Equilibrium boundary
+        dist_pct = (equil_bottom - price) / equil_bottom * 100
+        label    = f"BandB({dist_pct:.1f}%\u2193Equil)"
+        return (price <= band_b_ceil), label
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Filter funnel counter
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Filter funnel counter
+# ─────────────────────────────────────────────────────────────────────────────
+def _reset_filter_counts():
+    counts = {
+        "total_watchlist":  0,
+        "pre_filtered_out": 0,
+        "checked":          0,
+        # ── elimination counters (new F-order) ────────────────────────────────
+        "f2_pdz15m":        0,   # F2 — PDZ 15m
+        "f3_pdz5m":         0,   # F3 — PDZ 5m
+        "f4_rsi5m":         0,   # F4 — 5m RSI
+        "f5_rsi1h":         0,   # F5 — 1h RSI
+        "f6_ema":           0,   # F6 — EMA
+        # F7 MACD — per timeframe
+        "f7_macd_3m":       0,
+        "f7_macd_5m":       0,
+        "f7_macd_15m":      0,
+        # F8 SAR — per timeframe
+        "f8_sar_3m":        0,
+        "f8_sar_5m":        0,
+        "f8_sar_15m":       0,
+        "f9_vol":           0,   # F9 — Vol Spike
+        "f_empty_data":     0,   # Stage 2 candle fetch returned empty for a timeframe
+        "passed":           0,
+        "super_setup":      0,   # subset of passed — 15m Discount instant buys
+        "errors":           0,
+        "scan_cfg":         {},
+        # ── per-stage symbol lists ─────────────────────────────────────────────
+        "pre_filter_passed_syms": [],
+        "checked_syms":           [],
+        "f2_elim_syms":           [],
+        "f3_elim_syms":           [],
+        "f4_elim_syms":           [],
+        "f5_elim_syms":           [],
+        "f6_elim_syms":           [],
+        "f7_macd_3m_elim_syms":   [],
+        "f7_macd_5m_elim_syms":   [],
+        "f7_macd_15m_elim_syms":  [],
+        "f8_sar_3m_elim_syms":    [],
+        "f8_sar_5m_elim_syms":    [],
+        "f8_sar_15m_elim_syms":   [],
+        "f9_elim_syms":           [],
+        "f_empty_data_syms":      [],
+        "passed_syms":            [],
+        "super_setup_syms":       [],
+    }
+    with _filter_lock:
+        _filter_counts.clear()
+        _filter_counts.update(counts)
+        _b._bsc_filter_counts = _filter_counts   # keep reference in sync under lock
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-coin processing
+# ─────────────────────────────────────────────────────────────────────────────
+def process(sym, cfg: dict):
+    try:
+        with _filter_lock:
+            _filter_counts["checked"] = _filter_counts.get("checked", 0) + 1
+            _filter_counts["checked_syms"].append(sym)
+
+        # ── Stage 1: Quick parallel fetch — 5m (entry/RSI) + 15m (PDZ) ───────
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_5m_q  = pool.submit(get_klines, sym, "5m",  300)
+            f_15m_q = pool.submit(get_klines, sym, "15m", 300)
+            m5_quick  = f_5m_q.result()[:-1]
+            m15_quick = f_15m_q.result()[:-1]
+
+        closes_5m_q = [c["close"] for c in m5_quick]
+        entry_q     = _pround(m5_quick[-1]["close"])
+
+        # ── F2: PDZ 15m — checked FIRST (Super Setup possible) ───────────────
+        pdz_zone_15m   = "—"
+        is_super_setup = False
+        if cfg.get("use_pdz_15m", True):
+            pdz_pass_15m, pdz_zone_15m = calc_pdz_zone(m15_quick, entry_q)
+            if pdz_zone_15m == "Discount":
+                is_super_setup = True          # ⭐ skip all remaining filters
+            elif not pdz_pass_15m:
+                with _filter_lock:
+                    _filter_counts["f2_pdz15m"] = _filter_counts.get("f2_pdz15m", 0) + 1
+                    _filter_counts["f2_elim_syms"].append(sym)
+                return None
+            # else Band A/B passes — continue to F3
+
+        # ── SUPER SETUP — 15m Discount → instant trade, no further checks ─────
+        if is_super_setup:
+            tp      = _pround(entry_q * (1 + cfg["tp_pct"] / 100))
+            _ss_lev = max(1, int(cfg.get("trade_leverage", 10)))
+            sl      = (_pround(entry_q * (1 - 1 / _ss_lev))
+                       if cfg.get("trade_margin_mode", "isolated") == "isolated"
+                       else _pround(entry_q * (1 - cfg["sl_pct"] / 100)))
+            sec     = SECTORS.get(sym, "Other")
+            max_lev = get_max_leverage(sym)
+            with _filter_lock:
+                _filter_counts["passed"]           = _filter_counts.get("passed", 0) + 1
+                _filter_counts["super_setup"]      = _filter_counts.get("super_setup", 0) + 1
+                _filter_counts["passed_syms"].append(sym)
+                _filter_counts["super_setup_syms"].append(sym)
+            return {
+                "id":             str(uuid.uuid4())[:8],
+                "timestamp":      dubai_now().isoformat(),
+                "symbol":         sym,
+                "entry":          entry_q,
+                "tp":             tp,
+                "sl":             sl,
+                "sector":         sec,
+                "status":         "open",
+                "close_price":    None,
+                "close_time":     None,
+                "max_lev":        max_lev,
+                "is_super_setup": True,
+                "criteria": {
+                    "rsi_5m": "—", "rsi_1h": "—",
+                    "ema_3m": "—", "ema_5m": "—", "ema_15m": "—",
+                    "macd_3m": "—", "macd_5m": "—", "macd_15m": "—",
+                    "sar_3m": "—", "sar_5m": "—", "sar_15m": "—",
+                    "vol_ratio": "—",
+                    "pdz_zone_5m":  "—",
+                    "pdz_zone_15m": pdz_zone_15m,
+                },
+            }
+
+        # ── F3: PDZ 5m ────────────────────────────────────────────────────────
+        pdz_zone_5m = "—"
+        if cfg.get("use_pdz_5m", True):
+            pdz_pass_5m, pdz_zone_5m = calc_pdz_zone(m5_quick, entry_q)
+            if not pdz_pass_5m:
+                with _filter_lock:
+                    _filter_counts["f3_pdz5m"] = _filter_counts.get("f3_pdz5m", 0) + 1
+                    _filter_counts["f3_elim_syms"].append(sym)
+                return None
+
+        # ── F4: Quick 5m RSI (still early — before full fetch) ────────────────
+        rsi5_q = (calc_rsi_series(closes_5m_q) or [0])[-1]
+        if cfg.get("use_rsi_5m", True) and rsi5_q < cfg["rsi_5m_min"]:
+            with _filter_lock:
+                _filter_counts["f4_rsi5m"] = _filter_counts.get("f4_rsi5m", 0) + 1
+                _filter_counts["f4_elim_syms"].append(sym)
+            return None
+
+        # ── Stage 2: Fetch ONLY new timeframes — 1h and 3m ──────────────────
+        # 5m and 15m are already in m5_quick / m15_quick from Stage 1 (300 candles
+        # each — more than enough for EMA/MACD/SAR which need ~50-210 candles).
+        # Re-fetching them was the biggest source of duplicate API calls and the
+        # main driver of OKX 429 rate-limit hits → 30-second sleeps → 300s scan time.
+        #
+        # Only 1h (RSI) and 3m (EMA/MACD/SAR) are genuinely new here.
+        # This cuts Stage 2 from 4 API calls per coin → 2 API calls per coin.
+        _need_3m_detail = (cfg.get("use_ema_3m") or cfg.get("use_macd_3m")
+                           or cfg.get("use_sar_3m"))
+        candle_limit_3m = 80 if _need_3m_detail else 30
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_1h = pool.submit(get_klines, sym, "1h", 19)
+            f_3m = pool.submit(get_klines, sym, "3m", candle_limit_3m)
+            m1h_candles = f_1h.result()[:-1]
+            m3_candles  = f_3m.result()[:-1]
+
+        # Reuse Stage 1 data for 5m and 15m — no re-fetch needed
+        m5  = m5_quick
+        m15 = m15_quick
+
+        # ── Guard: check all required timeframes have data ────────────────────
+        _missing_tf = [tf for tf, bars in (("5m", m5), ("15m", m15),
+                                            ("1h", m1h_candles), ("3m", m3_candles))
+                       if not bars]
+        if _missing_tf:
+            with _filter_lock:
+                _filter_counts["f_empty_data"] = _filter_counts.get("f_empty_data", 0) + 1
+                _filter_counts["f_empty_data_syms"].append(
+                    f"{sym}(no {','.join(_missing_tf)})")
+            return None
+
+        closes_5m  = [c["close"] for c in m5]
+        closes_15m = [c["close"] for c in m15]
+        closes_3m  = [c["close"] for c in m3_candles]
+        closes_1h  = [c["close"] for c in m1h_candles]
+        entry      = _pround(m5[-1]["close"])
+
+        # ── F5: 1h RSI ────────────────────────────────────────────────────────
+        rsi1h = (calc_rsi_series(closes_1h) or [0])[-1]
+        if cfg.get("use_rsi_1h", True) and \
+                not (cfg["rsi_1h_min"] <= rsi1h <= cfg["rsi_1h_max"]):
+            with _filter_lock:
+                _filter_counts["f5_rsi1h"] = _filter_counts.get("f5_rsi1h", 0) + 1
+                _filter_counts["f5_elim_syms"].append(sym)
+            return None
+
+        # ── F6: EMA ───────────────────────────────────────────────────────────
+        ema_3m_val = ema_5m_val = ema_15m_val = None
+        if cfg.get("use_ema_3m"):
+            ema = calc_ema(closes_3m, max(2, int(cfg.get("ema_period_3m", 12))))
+            if not ema or entry < ema[-1]:
+                with _filter_lock:
+                    _filter_counts["f6_ema"] = _filter_counts.get("f6_ema", 0) + 1
+                    _filter_counts["f6_elim_syms"].append(sym)
+                return None
+            ema_3m_val = _pround(ema[-1])
+        if cfg.get("use_ema_5m"):
+            ema = calc_ema(closes_5m, max(2, int(cfg.get("ema_period_5m", 12))))
+            if not ema or entry < ema[-1]:
+                with _filter_lock:
+                    _filter_counts["f6_ema"] = _filter_counts.get("f6_ema", 0) + 1
+                    _filter_counts["f6_elim_syms"].append(sym)
+                return None
+            ema_5m_val = _pround(ema[-1])
+        if cfg.get("use_ema_15m"):
+            ema = calc_ema(closes_15m, max(2, int(cfg.get("ema_period_15m", 12))))
+            if not ema or entry < ema[-1]:
+                with _filter_lock:
+                    _filter_counts["f6_ema"] = _filter_counts.get("f6_ema", 0) + 1
+                    _filter_counts["f6_elim_syms"].append(sym)
+                return None
+            ema_15m_val = _pround(ema[-1])
+
+        # ── F7: MACD dark-green — per-timeframe independent checks ──────────
+        # Each enabled timeframe is checked in order (3m → 5m → 15m).
+        # The first failure increments that timeframe's own counter and eliminates
+        # the coin — giving the funnel an accurate per-timeframe breakdown.
+        macd_3m_val = macd_5m_val = macd_15m_val = None
+        _macd_3m_on  = cfg.get("use_macd_3m",  True)
+        _macd_5m_on  = cfg.get("use_macd_5m",  True)
+        _macd_15m_on = cfg.get("use_macd_15m", True)
+        if _macd_3m_on and not macd_bullish(closes_3m):
+            with _filter_lock:
+                _filter_counts["f7_macd_3m"] = _filter_counts.get("f7_macd_3m", 0) + 1
+                _filter_counts["f7_macd_3m_elim_syms"].append(sym)
+            return None
+        if _macd_5m_on and not macd_bullish(closes_5m):
+            with _filter_lock:
+                _filter_counts["f7_macd_5m"] = _filter_counts.get("f7_macd_5m", 0) + 1
+                _filter_counts["f7_macd_5m_elim_syms"].append(sym)
+            return None
+        if _macd_15m_on and not macd_bullish(closes_15m):
+            with _filter_lock:
+                _filter_counts["f7_macd_15m"] = _filter_counts.get("f7_macd_15m", 0) + 1
+                _filter_counts["f7_macd_15m_elim_syms"].append(sym)
+            return None
+        # Store MACD line values for criteria display
+        if _macd_3m_on:
+            ml3, _, _ = calc_macd(closes_3m)
+            if ml3: macd_3m_val = round(ml3[-1], 8)
+        if _macd_5m_on:
+            ml5, _, _ = calc_macd(closes_5m)
+            if ml5: macd_5m_val = round(ml5[-1], 8)
+        if _macd_15m_on:
+            ml15, _, _ = calc_macd(closes_15m)
+            if ml15: macd_15m_val = round(ml15[-1], 8)
+
+        # ── F8: Parabolic SAR — per-timeframe independent checks ─────────────
+        # Each enabled timeframe checked in order (3m → 5m → 15m).
+        # First failure increments that timeframe's counter and eliminates the coin.
+        sar_3m_val = sar_5m_val = sar_15m_val = None
+        _sar_3m_on  = cfg.get("use_sar_3m",  True)
+        _sar_5m_on  = cfg.get("use_sar_5m",  True)
+        _sar_15m_on = cfg.get("use_sar_15m", True)
+        if _sar_3m_on:
+            sar_3m = calc_parabolic_sar(m3_candles)
+            if not (sar_3m and sar_3m[-1][1]):
+                with _filter_lock:
+                    _filter_counts["f8_sar_3m"] = _filter_counts.get("f8_sar_3m", 0) + 1
+                    _filter_counts["f8_sar_3m_elim_syms"].append(sym)
+                return None
+            sar_3m_val = _pround(sar_3m[-1][0])
+        if _sar_5m_on:
+            sar_5m = calc_parabolic_sar(m5)
+            if not (sar_5m and sar_5m[-1][1]):
+                with _filter_lock:
+                    _filter_counts["f8_sar_5m"] = _filter_counts.get("f8_sar_5m", 0) + 1
+                    _filter_counts["f8_sar_5m_elim_syms"].append(sym)
+                return None
+            sar_5m_val = _pround(sar_5m[-1][0])
+        if _sar_15m_on:
+            sar_15m = calc_parabolic_sar(m15)
+            if not (sar_15m and sar_15m[-1][1]):
+                with _filter_lock:
+                    _filter_counts["f8_sar_15m"] = _filter_counts.get("f8_sar_15m", 0) + 1
+                    _filter_counts["f8_sar_15m_elim_syms"].append(sym)
+                return None
+            sar_15m_val = _pround(sar_15m[-1][0])
+
+        # ── F9: Volume Spike ──────────────────────────────────────────────────
+        vol_ratio = None
+        if cfg.get("use_vol_spike"):
+            lookback = max(2, int(cfg.get("vol_spike_lookback", 20)))
+            mult     = float(cfg.get("vol_spike_mult", 2.0))
+            vols_15m = [c["volume"] for c in m15]
+            if len(vols_15m) >= lookback + 1:
+                window   = vols_15m[-(lookback+1):-1]
+                avg_vol  = sum(window) / len(window)
+                if avg_vol <= 0 or vols_15m[-1] < mult * avg_vol:
+                    with _filter_lock:
+                        _filter_counts["f9_vol"] = _filter_counts.get("f9_vol", 0) + 1
+                        _filter_counts["f9_elim_syms"].append(sym)
+                    return None
+                vol_ratio = round(vols_15m[-1] / avg_vol, 2) if avg_vol > 0 else None
+
+        # ── All filters passed ────────────────────────────────────────────────
+        tp      = _pround(entry * (1 + cfg["tp_pct"] / 100))
+        _lev_sl = max(1, int(cfg.get("trade_leverage", 10)))
+        sl      = (_pround(entry * (1 - 1 / _lev_sl))
+                   if cfg.get("trade_margin_mode", "isolated") == "isolated"
+                   else _pround(entry * (1 - cfg["sl_pct"] / 100)))
+        sec     = SECTORS.get(sym, "Other")
+        max_lev = get_max_leverage(sym)
+
+        with _filter_lock:
+            _filter_counts["passed"] = _filter_counts.get("passed", 0) + 1
+            _filter_counts["passed_syms"].append(sym)
+
+        rsi5 = (calc_rsi_series(closes_5m) or [rsi5_q])[-1]
+        criteria = {
+            "rsi_5m":       round(rsi5,  1),
+            "rsi_1h":       round(rsi1h, 1),
+            "ema_3m":       ema_3m_val  if cfg.get("use_ema_3m")    else "—",
+            "ema_5m":       ema_5m_val  if cfg.get("use_ema_5m")    else "—",
+            "ema_15m":      ema_15m_val if cfg.get("use_ema_15m")   else "—",
+            "macd_3m":      macd_3m_val  if cfg.get("use_macd_3m",  True) else "—",
+            "macd_5m":      macd_5m_val  if cfg.get("use_macd_5m",  True) else "—",
+            "macd_15m":     macd_15m_val if cfg.get("use_macd_15m", True) else "—",
+            "sar_3m":       sar_3m_val   if cfg.get("use_sar_3m",   True) else "—",
+            "sar_5m":       sar_5m_val   if cfg.get("use_sar_5m",   True) else "—",
+            "sar_15m":      sar_15m_val  if cfg.get("use_sar_15m",  True) else "—",
+            "vol_ratio":    vol_ratio    if cfg.get("use_vol_spike") else "—",
+            "pdz_zone_5m":  pdz_zone_5m  if cfg.get("use_pdz_5m",  True) else "—",
+            "pdz_zone_15m": pdz_zone_15m if cfg.get("use_pdz_15m", True) else "—",
+        }
+
+        return {
+            "id":             str(uuid.uuid4())[:8],
+            "timestamp":      dubai_now().isoformat(),
+            "symbol":         sym,
+            "entry":          entry,
+            "tp":             tp,
+            "sl":             sl,
+            "sector":         sec,
+            "status":         "open",
+            "close_price":    None,
+            "close_time":     None,
+            "max_lev":        max_lev,
+            "is_super_setup": False,
+            "criteria":       criteria,
+        }
+
+    except Exception as _proc_exc:
+        with _filter_lock:
+            _filter_counts["errors"] = _filter_counts.get("errors", 0) + 1
+        _append_error("scan", str(_proc_exc), symbol=sym)
+        return "error"
+
+def scan(cfg: dict):
+    _reset_filter_counts()
+    with _filter_lock:                          # store config used for this scan
+        _filter_counts["scan_cfg"] = dict(cfg)
+
+    # D — cached symbol list (one instrument API call max every 6 h)
+    symbols = get_symbols_cached(cfg["watchlist"])
+    with _filter_lock:
+        _filter_counts["total_watchlist"] = len(symbols)
+
+    # A — bulk ticker pre-filter (1 API call → eliminates ~70 % of coins)
+    tickers = get_bulk_tickers()
+    if cfg.get("use_pre_filter", True):
+        pre_filtered = pre_filter_by_ticker(symbols, tickers)
+    else:
+        pre_filtered = list(symbols)   # pre-filter disabled — deep-scan all
+    with _filter_lock:
+        _filter_counts["pre_filtered_out"] = len(symbols) - len(pre_filtered)
+        _filter_counts["pre_filter_passed_syms"] = list(pre_filtered)
+
+    print(f"[Scan] {len(symbols)} valid symbols → "
+          f"{len(pre_filtered)} after bulk pre-filter "
+          f"({'disabled' if not cfg.get('use_pre_filter', True) else _filter_counts['pre_filtered_out']} removed)")
+
+    results = []
+    # 10 outer workers — semaphore(5) caps actual concurrent HTTP requests to 5
+    # so more workers just means less idle time between coin batches, not more API pressure.
+    with ThreadPoolExecutor(max_workers=10) as exe:
+        futs = [exe.submit(process, s, cfg) for s in pre_filtered]
+        for f in as_completed(futs):
+            r = f.result()
+            if r and r != "error":
+                results.append(r)
+
+    return sorted(results, key=lambda x: x["symbol"]), _filter_counts.get("errors", 0)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Open signal tracker
+# ─────────────────────────────────────────────────────────────────────────────
+_PRICE_ALERT_PCT = 3.0   # alert when current price is this % or more below entry
+
+def _update_one_signal(sig: dict) -> None:
+    """Fetch candles for a single open signal and update its status in-place.
+
+    Runs inside a ThreadPoolExecutor — must not hold any locks.
+    All writes go directly into the signal dict (dicts are shared references).
+    """
+    try:
+        sig_ts_ms = int(datetime.fromisoformat(sig["timestamp"]).timestamp() * 1000)
+        candles   = get_klines(sig["symbol"], "5m", 200)
+        post      = [c for c in candles if c["time"] >= sig_ts_ms]
+        tp_time = sl_time = None
+        for c in post:
+            if tp_time is None and c["high"] >= sig["tp"]: tp_time = c["time"]
+            if sl_time is None and c["low"]  <= sig["sl"]: sl_time = c["time"]
+        if tp_time is not None or sl_time is not None:
+            if tp_time is not None and (sl_time is None or tp_time <= sl_time):
+                sig.update(status="tp_hit", close_price=sig["tp"],
+                           close_time=to_dubai(datetime.fromtimestamp(
+                               tp_time/1000, tz=timezone.utc)).isoformat())
+                sig.pop("price_alert", None)
+            else:
+                sig.update(status="sl_hit", close_price=sig["sl"],
+                           close_time=to_dubai(datetime.fromtimestamp(
+                               sl_time/1000, tz=timezone.utc)).isoformat())
+                sig.pop("price_alert", None)
+        else:
+            # Trade still open — update price-drop alert flag
+            if candles:
+                latest_price = candles[-1]["close"]
+                entry_price  = float(sig.get("entry", 0) or 0)
+                if entry_price > 0:
+                    drop_pct = (entry_price - latest_price) / entry_price * 100
+                    sig["price_alert"]     = drop_pct >= _PRICE_ALERT_PCT
+                    sig["price_alert_pct"] = round(drop_pct, 2)
+                else:
+                    sig["price_alert"]     = False
+                    sig["price_alert_pct"] = 0.0
+    except Exception:
+        pass
+
+
+def update_open_signals(signals):
+    """Update all open signals in parallel (one candle fetch per open trade).
+
+    Previously sequential — with 15 open trades this blocked for ~4-5 s.
+    Now all fetches run concurrently, cutting Phase 1 to ~0.3-0.8 s.
+    """
+    open_sigs = [s for s in signals if s["status"] == "open"]
+    if not open_sigs:
+        return signals   # nothing to do — skip thread overhead entirely
+
+    # Each worker fetches 200×5m candles for one trade.  Cap at 15 workers
+    # (matches MAX_OPEN_TRADES) — well within the _api_sem(20) concurrency window.
+    with ThreadPoolExecutor(max_workers=min(len(open_sigs), 15)) as pool:
+        futs = [pool.submit(_update_one_signal, s) for s in open_sigs]
+        for f in as_completed(futs):
+            f.result()   # re-raise any unexpected exception for logging
+
+    return signals
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Background scanner thread
+# ─────────────────────────────────────────────────────────────────────────────
+def _check_sl_circuit_breaker():
+    """Return True if the last 3 closed trades are all sl_hit (triggers auto-pause)."""
+    with _log_lock:
+        _closed = sorted(
+            [s for s in _b._bsc_log["signals"]
+             if s.get("status") in ("tp_hit", "sl_hit") and s.get("close_time")],
+            key=lambda x: x.get("close_time", ""),
+        )
+    return len(_closed) >= 3 and all(s["status"] == "sl_hit" for s in _closed[-3:])
+
+
+def _bg_loop():
+    while True:
+        # Pause if user manually stopped OR circuit breaker fired (3 consec SL)
+        if not _scanner_running.is_set() or getattr(_b, "_bsc_sl_paused", False):
+            time.sleep(2); continue
+        with _config_lock:
+            cfg = dict(_b._bsc_cfg)
+        t0 = time.time()
+        try:
+            with _log_lock:
+                _b._bsc_log["signals"] = update_open_signals(_b._bsc_log["signals"])
+
+            # ── Circuit breaker: check AFTER updating signals so newly-closed
+            # sl_hit trades are counted immediately ─────────────────────────
+            if _check_sl_circuit_breaker():
+                _b._bsc_sl_paused = True
+                continue   # halt this cycle; UI will show the resume banner
+
+            new_sigs, errors = scan(cfg)
+            cutoff = dubai_now() - timedelta(minutes=cfg["cooldown_minutes"])
+            with _log_lock:
+                # Cooldown measured from close_time of last closed trade (TP/SL hit)
+                cooled = {s["symbol"] for s in _b._bsc_log["signals"]
+                          if s.get("close_time")
+                          and s.get("status") in ("tp_hit", "sl_hit")
+                          and datetime.fromisoformat(s["close_time"].replace("Z","+00:00")) >= cutoff}
+                active = {s["symbol"] for s in _b._bsc_log["signals"] if s["status"]=="open"}
+                # ── Queue-limit check ─────────────────────────────────────────
+                # Count only genuinely OPEN trades (queue_limit entries are NOT
+                # real open positions — no order was placed for them).
+                open_trade_count = len(active)
+                MAX_OPEN_TRADES  = 15
+                _new_sig_syms      = [s["symbol"] for s in new_sigs]
+                _blocked_active    = sorted(active  & set(_new_sig_syms))
+                _blocked_cooldown  = sorted(cooled  & set(_new_sig_syms))
+                skip         = cooled | active
+                _added_syms  = []
+                _queued_syms = []           # symbols logged as queue_limit this cycle
+                sigs_to_trade = []          # signals that need an order placed
+                for sig in new_sigs:
+                    if sig["symbol"] not in skip:
+                        if open_trade_count >= MAX_OPEN_TRADES:
+                            # ── Queue Limit: log the signal but do NOT place a trade
+                            # and do NOT add to `active` / `skip` so this coin
+                            # remains freely re-scannable on every future cycle.
+                            # No cooldown applies because no trade was ever opened.
+                            queued_sig = dict(sig)
+                            queued_sig["status"] = "queue_limit"
+                            _b._bsc_log["signals"].append(queued_sig)
+                            _queued_syms.append(sig["symbol"])
+                            # Add to skip only for THIS cycle to prevent duplicate
+                            # queue_limit entries within the same scan batch.
+                            skip.add(sig["symbol"])
+                        else:
+                            _b._bsc_log["signals"].append(sig)
+                            skip.add(sig["symbol"])
+                            _added_syms.append(sig["symbol"])
+                            open_trade_count += 1   # keep running count accurate
+                            if (cfg.get("trade_enabled") and
+                                    cfg.get("api_key") and cfg.get("api_secret") and
+                                    cfg.get("api_passphrase")):
+                                sigs_to_trade.append(sig)
+                _filter_counts["new_signal_syms"]         = _added_syms
+                _filter_counts["queued_syms"]             = _queued_syms
+                _filter_counts["blocked_by_active_syms"]  = _blocked_active
+                _filter_counts["blocked_by_cooldown_syms"]= _blocked_cooldown
+                elapsed = time.time() - t0
+                _b._bsc_log["health"].update(
+                    total_cycles         = _b._bsc_log["health"].get("total_cycles",0)+1,
+                    last_scan_at         = dubai_now().isoformat(),
+                    last_scan_duration_s = round(elapsed, 1),
+                    total_api_errors     = _b._bsc_log["health"].get("total_api_errors",0)+errors,
+                    watchlist_size       = len(cfg["watchlist"]),
+                    pre_filtered_out     = _filter_counts.get("pre_filtered_out",0),
+                    deep_scanned         = _filter_counts.get("checked",0),
+                )
+                save_log(_b._bsc_log)
+
+            # ── Place orders outside the log lock ────────────────────────────
+            # sigs_to_trade are already appended to _b._bsc_log["signals"],
+            # so in-place dict updates here are reflected in the stored log.
+            if sigs_to_trade:
+                for sig in sigs_to_trade:
+                    result = place_okx_order(sig, cfg)
+                    sig["order_id"]          = result.get("ordId", "")
+                    sig["algo_id"]           = result.get("algoId", "")
+                    sig["order_sz"]          = result.get("sz", 0)
+                    sig["order_status"]      = result.get("status", "")
+                    sig["order_error"]       = result.get("error", "")
+                    sig["trade_usdt"]        = float(cfg.get("trade_usdt_amount", 0))
+                    sig["trade_lev"]         = int(cfg.get("trade_leverage", 10))
+                    sig["demo_mode"]         = bool(cfg.get("demo_mode", True))
+                    sig["order_ct_val"]      = float(result.get("ct_val", 0) or 0)
+                    sig["order_notional"]    = float(result.get("notional", 0) or 0)
+                    sig["order_margin_mode"] = result.get("tdMode", "cross")
+                    sig["order_is_hedge"]    = bool(result.get("is_hedge", False))
+                    # Overwrite entry/TP/SL with actual fill values if available.
+                    # Market orders fill at the live price, not the signal price —
+                    # the OCO algo order was placed using these corrected levels.
+                    if result.get("actual_entry"):
+                        sig["entry"]        = result["actual_entry"]
+                        sig["tp"]           = result["actual_tp"]
+                        sig["sl"]           = result["actual_sl"]
+                        sig["signal_entry"] = sig.get("entry")  # keep original for reference
+                with _log_lock:
+                    save_log(_b._bsc_log)
+            _b._bsc_last_error = ""
+        except Exception as e:
+            _b._bsc_last_error = str(e)
+            _append_error("loop", str(e))
+        elapsed   = time.time() - t0
+        sleep_sec = max(0, cfg["loop_minutes"] * 60 - elapsed)
+        # Wait for sleep_sec, but wake immediately if Save & Apply triggers rescan
+        _rescan_event.wait(timeout=sleep_sec)
+        _rescan_event.clear()
+
+def _ensure_scanner():
+    if _b._bsc_thread is None or not _b._bsc_thread.is_alive():
+        t = threading.Thread(target=_bg_loop, daemon=True, name="okx-scanner")
+        t.start(); _b._bsc_thread = t
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STREAMLIT UI
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="S&R — Crypto Intelligent System, By Trends and Trade", page_icon="💎",
+                   layout="wide", initial_sidebar_state="expanded")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Option 2 — Dark Navy + Gold  (S&R Crypto Intelligent Portal theme)
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* ── Google Fonts ─────────────────────────────────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* ── Global base ──────────────────────────────────────────────────────────── */
+html, body, [class*="css"] {
+    font-family: 'Sora', sans-serif !important;
+    color: #F9FAFB !important;
+}
+
+/* ── App background ───────────────────────────────────────────────────────── */
+.stApp {
+    background-color: #0A0F1E !important;
+}
+
+/* ── Sidebar ──────────────────────────────────────────────────────────────── */
+[data-testid="stSidebar"] {
+    background-color: #0D1424 !important;
+    border-right: 1px solid #C9A84C33 !important;
+}
+[data-testid="stSidebar"] * {
+    color: #F9FAFB !important;
+}
+[data-testid="stSidebar"] .stMarkdown h2 {
+    color: #C9A84C !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.04em !important;
+    border-bottom: 1px solid #C9A84C55 !important;
+    padding-bottom: 6px !important;
+}
+
+/* ── Main area headings ───────────────────────────────────────────────────── */
+h1 {
+    font-family: 'Sora', sans-serif !important;
+    font-weight: 700 !important;
+    font-size: 1.9rem !important;
+    color: #C9A84C !important;
+    letter-spacing: 0.05em !important;
+    border-bottom: 2px solid #C9A84C55 !important;
+    padding-bottom: 8px !important;
+    margin-bottom: 12px !important;
+}
+h2, h3 {
+    font-family: 'Sora', sans-serif !important;
+    font-weight: 600 !important;
+    color: #F9FAFB !important;
+    letter-spacing: 0.03em !important;
+}
+
+/* ── Metrics ──────────────────────────────────────────────────────────────── */
+[data-testid="stMetric"] {
+    background-color: #111827 !important;
+    border: 1px solid #C9A84C44 !important;
+    border-radius: 8px !important;
+    padding: 10px 14px !important;
+}
+[data-testid="stMetricLabel"] {
+    color: #C9A84C !important;
+    font-size: 0.72rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.08em !important;
+}
+[data-testid="stMetricValue"] {
+    color: #F9FAFB !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 1.4rem !important;
+    font-weight: 500 !important;
+}
+
+/* ── Dataframes ───────────────────────────────────────────────────────────── */
+[data-testid="stDataFrame"] {
+    border: 1px solid #C9A84C33 !important;
+    border-radius: 8px !important;
+    overflow: hidden !important;
+}
+[data-testid="stDataFrame"] * {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.78rem !important;
+}
+
+/* ── Buttons ──────────────────────────────────────────────────────────────── */
+.stButton > button {
+    background-color: #111827 !important;
+    color: #F9FAFB !important;
+    border: 1px solid #C9A84C66 !important;
+    border-radius: 6px !important;
+    font-family: 'Sora', sans-serif !important;
+    font-weight: 600 !important;
+    font-size: 0.78rem !important;
+    letter-spacing: 0.04em !important;
+    transition: all 0.15s ease !important;
+}
+.stButton > button:hover {
+    background-color: #C9A84C !important;
+    color: #0A0F1E !important;
+    border-color: #C9A84C !important;
+}
+.stButton > button[kind="primary"] {
+    background-color: #C9A84C !important;
+    color: #0A0F1E !important;
+    border-color: #C9A84C !important;
+    font-weight: 700 !important;
+}
+.stButton > button[kind="primary"]:hover {
+    background-color: #E0BE6A !important;
+}
+
+/* ── Expanders ────────────────────────────────────────────────────────────── */
+[data-testid="stExpander"] {
+    background-color: #111827 !important;
+    border: 1px solid #C9A84C33 !important;
+    border-radius: 8px !important;
+}
+[data-testid="stExpander"] summary {
+    color: #C9A84C !important;
+    font-weight: 600 !important;
+    font-size: 0.85rem !important;
+    letter-spacing: 0.03em !important;
+}
+
+/* ── Dividers ─────────────────────────────────────────────────────────────── */
+hr {
+    border-color: #C9A84C33 !important;
+}
+
+/* ── Captions & info boxes ────────────────────────────────────────────────── */
+[data-testid="stCaptionContainer"] {
+    color: #9CA3AF !important;
+    font-size: 0.74rem !important;
+}
+[data-testid="stInfo"] {
+    background-color: #111827 !important;
+    border-left: 3px solid #C9A84C !important;
+    color: #F9FAFB !important;
+    border-radius: 6px !important;
+}
+[data-testid="stSuccess"] {
+    background-color: #052E16 !important;
+    border-left: 3px solid #10B981 !important;
+    color: #D1FAE5 !important;
+}
+[data-testid="stWarning"] {
+    background-color: #1C1508 !important;
+    border-left: 3px solid #FBBF24 !important;
+    color: #FEF3C7 !important;
+}
+[data-testid="stError"] {
+    background-color: #2D0B0B !important;
+    border-left: 3px solid #F43F5E !important;
+    color: #FFE4E6 !important;
+}
+
+/* ── Inputs / selects / checkboxes ───────────────────────────────────────── */
+[data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input,
+[data-testid="stTextArea"] textarea,
+[data-testid="stSelectbox"] select {
+    background-color: #111827 !important;
+    color: #F9FAFB !important;
+    border: 1px solid #C9A84C44 !important;
+    border-radius: 6px !important;
+    font-family: 'JetBrains Mono', monospace !important;
+}
+[data-testid="stCheckbox"] label {
+    color: #F9FAFB !important;
+    font-size: 0.82rem !important;
+}
+
+/* ── Plotly chart backgrounds ─────────────────────────────────────────────── */
+.js-plotly-plot .plotly .bg {
+    fill: #111827 !important;
+}
+
+/* ── Scrollbar ────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #0A0F1E; }
+::-webkit-scrollbar-thumb { background: #C9A84C55; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #C9A84C; }
+</style>
+""", unsafe_allow_html=True)
+
+_ensure_scanner()
+
+with _log_lock:    _snap_log = json.loads(json.dumps(_b._bsc_log))
+with _config_lock: _snap_cfg = dict(_b._bsc_cfg)
+
+health  = _snap_log.get("health", {})
+signals = _snap_log.get("signals", [])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ⚙️ Configuration")
+    running   = _scanner_running.is_set()
+    btn_label = "⏹ Stop Scanner" if running else "▶️ Start Scanner"
+    if st.button(btn_label, use_container_width=True, type="primary" if running else "secondary"):
+        if running: _scanner_running.clear()
+        else:       _scanner_running.set()
+        st.rerun()
+    st.caption(f"{'🟢' if running else '🔴'}  Scanner {'running' if running else 'stopped'}")
+
+    # ── Circuit Breaker Status ─────────────────────────────────────────────────
+    _sl_paused = getattr(_b, "_bsc_sl_paused", False)
+    if _sl_paused:
+        st.warning(
+            "🔴 **Paused — 3 consecutive SL hit**\n\n"
+            "Review market conditions before resuming.",
+            icon=None,
+        )
+        if st.button("▶️ Resume Scanning", key="resume_sl_circuit",
+                     type="primary", use_container_width=True):
+            _b._bsc_sl_paused = False
+            _rescan_event.set()
+            st.rerun()
+    else:
+        st.success("✅ **Circuit Breaker: OK**  —  No consecutive SL pause", icon=None)
+    st.divider()
+
+    # ── Auto-Trading ───────────────────────────────────────────────────────────
+    st.markdown("**🤖 Auto-Trading**")
+    new_trade_enabled = st.checkbox(
+        "Enable Auto-Trading",
+        value=bool(_snap_cfg.get("trade_enabled", False)), key="cfg_trade_enabled",
+        help="Automatically place a market LONG order on OKX when a signal fires.")
+
+    new_demo_mode = st.radio(
+        "Environment", ["Demo", "Live"],
+        index=0 if _snap_cfg.get("demo_mode", True) else 1,
+        horizontal=True, key="cfg_demo_mode",
+        help="Demo uses x-simulated-trading header. Live places real orders.",
+        disabled=not new_trade_enabled)
+    if new_trade_enabled and new_demo_mode == "Live":
+        st.warning("⚠️ LIVE mode — real funds at risk!")
+
+    new_api_key = st.text_input(
+        "API Key", value=_snap_cfg.get("api_key", ""),
+        key="cfg_api_key", disabled=not new_trade_enabled,
+        placeholder="Your OKX API key")
+    new_api_secret = st.text_input(
+        "API Secret", value=_snap_cfg.get("api_secret", ""),
+        key="cfg_api_secret", type="password", disabled=not new_trade_enabled,
+        placeholder="Your OKX API secret")
+    new_api_passphrase = st.text_input(
+        "API Passphrase", value=_snap_cfg.get("api_passphrase", ""),
+        key="cfg_api_passphrase", type="password", disabled=not new_trade_enabled,
+        placeholder="Your OKX API passphrase")
+
+    ta1, ta2 = st.columns(2)
+    new_trade_usdt = ta1.number_input(
+        "Size (USDT)", min_value=1.0, max_value=100000.0, step=1.0,
+        value=float(_snap_cfg.get("trade_usdt_amount", 10.0)),
+        key="cfg_trade_usdt", disabled=not new_trade_enabled,
+        help="Collateral per trade in USDT (before leverage)")
+    new_trade_lev = ta2.number_input(
+        "Leverage ×", min_value=1, max_value=125, step=1,
+        value=int(_snap_cfg.get("trade_leverage", 10)),
+        key="cfg_trade_lev", disabled=not new_trade_enabled,
+        help="Leverage applied (capped by OKX max for each coin)")
+    new_margin_mode = st.selectbox(
+        "Margin Mode", ["isolated", "cross"],
+        index=0 if _snap_cfg.get("trade_margin_mode", "isolated") == "isolated" else 1,
+        key="cfg_margin_mode", disabled=not new_trade_enabled)
+
+    if new_trade_enabled:
+        notional_usdt = new_trade_usdt * new_trade_lev
+        _liq_pct_cap  = round(100 / new_trade_lev, 2)
+        _sl_caption   = (f"SL @ liq ~{_liq_pct_cap:.1f}% below entry"
+                         if new_margin_mode == "isolated"
+                         else f"SL -${notional_usdt * _snap_cfg.get('sl_pct',3.0)/100:.2f}")
+        st.caption(f"📐 Notional per trade: ~${notional_usdt:,.0f} USDT   "
+                   f"| TP +${notional_usdt * _snap_cfg.get('tp_pct',1.5)/100:.2f}   "
+                   f"| {_sl_caption}")
+        st.caption("🔒 Credentials stored in scanner_config.json. "
+                   "Use a trade-only API key — never withdrawal permissions.")
+
+    # ── Connection test ────────────────────────────────────────────────────────
+    _conn = getattr(_b, "_bsc_api_conn_status",
+                    {"status": "untested", "message": "", "tested_at": None,
+                     "demo_mode": None, "uid": ""})
+    _has_creds = bool(_snap_cfg.get("api_key") and _snap_cfg.get("api_secret")
+                      and _snap_cfg.get("api_passphrase"))
+    if st.button("🔌 Test Connection", use_container_width=True,
+                 disabled=not _has_creds,
+                 help="Verify your API credentials against OKX right now."):
+        with st.spinner("Testing…"):
+            _result = test_api_connection(dict(_snap_cfg))
+        _b._bsc_api_conn_status = {
+            "status":    _result["status"],
+            "message":   _result["message"],
+            "tested_at": dubai_now().isoformat(),
+            "demo_mode": _snap_cfg.get("demo_mode", True),
+            "uid":       _result.get("uid", ""),
+            "pos_mode":  _result.get("pos_mode", "net_mode"),
+            "acct_lv":   _result.get("acct_lv", "2"),
+        }
+        st.rerun()
+
+    # Show last test result
+    _conn_now = getattr(_b, "_bsc_api_conn_status",
+                        {"status": "untested", "message": "", "tested_at": None})
+    _conn_status = _conn_now.get("status", "untested")
+    if _conn_status == "ok":
+        st.success(f"🟢 {_conn_now['message']}")
+        if _conn_now.get("uid"):
+            st.caption(f"UID: {_conn_now['uid']}  ·  tested {fmt_dubai(_conn_now['tested_at'])}")
+    elif _conn_status == "error":
+        st.error(f"🔴 {_conn_now['message']}")
+        st.caption(f"Last tested: {fmt_dubai(_conn_now['tested_at'])}")
+    else:
+        if _has_creds:
+            st.caption("⚫ Not tested yet — click Test Connection")
+        else:
+            st.caption("⚫ Enter API credentials above to enable")
+
+    # Show detected position mode (critical for order placement)
+    if _conn_status == "ok":
+        _pm = _conn_now.get("pos_mode", "net_mode")
+        if _pm == "long_short_mode":
+            st.info("📐 Position mode: **Hedge (Long/Short)** — `posSide: long` added to orders automatically.")
+        else:
+            st.info("📐 Position mode: **Net** — standard order placement.")
+
+    # ── Test Trade button (places + cancels a minimal BTCUSDT order) ──────────
+    _conn_ok = _conn_status == "ok" and _snap_cfg.get("trade_enabled", False)
+    if st.button("🧪 Test Trade (BTC · 1 contract)", use_container_width=True,
+                 disabled=not _conn_ok,
+                 help="Places a 1-contract market buy on BTCUSDT, then immediately cancels it. "
+                      "Use this to confirm order placement works before signals fire."):
+        with st.spinner("Placing test order…"):
+            _tc = dict(_snap_cfg)
+            _cs = getattr(_b, "_bsc_api_conn_status", {})
+            _is_h = _cs.get("pos_mode", "net_mode") == "long_short_mode"
+            _mode = _tc.get("trade_margin_mode", "cross")
+
+            # Set leverage
+            try:
+                _set_leverage_okx("BTCUSDT", _tc)
+            except Exception:
+                pass
+
+            _tbody: dict = {
+                "instId":  "BTC-USDT-SWAP",
+                "tdMode":  _mode,
+                "side":    "buy",
+                "ordType": "market",
+                "sz":      "1",
+            }
+            if _is_h:
+                _tbody["posSide"] = "long"
+
+            _tresp = _trade_post("/api/v5/trade/order", _tbody, _tc)
+            _b._bsc_last_trade_raw = {
+                "endpoint":  "/api/v5/trade/order",
+                "body_sent": _tbody,
+                "response":  _tresp,
+                "is_hedge":  _is_h,
+            }
+
+            # Immediately cancel if placed
+            _td0    = (_tresp.get("data") or [{}])[0]
+            _tordid = _td0.get("ordId", "")
+            if _tresp.get("code") == "0" and _tordid:
+                try:
+                    _trade_post("/api/v5/trade/cancel-order",
+                                {"instId": "BTC-USDT-SWAP", "ordId": _tordid}, _tc)
+                except Exception:
+                    pass
+                st.session_state["_test_trade_result"] = ("ok", f"✅ Test order placed & cancelled · ordId: {_tordid}")
+            else:
+                _terr = _okx_err(_tresp)
+                _append_error("trade", f"Test trade failed: {_terr} | body={json.dumps(_tbody)} | resp={json.dumps(_tresp)[:300]}", endpoint="/api/v5/trade/order")
+                st.session_state["_test_trade_result"] = ("err", f"❌ {_terr}")
+
+    _ttr = st.session_state.get("_test_trade_result")
+    if _ttr:
+        if _ttr[0] == "ok":
+            st.success(_ttr[1])
+        else:
+            st.error(_ttr[1])
+
+    # ── Raw response debug expander ───────────────────────────────────────────
+    _raw = getattr(_b, "_bsc_last_trade_raw", {})
+    if _raw:
+        with st.expander("🔬 Last order raw response (debug)"):
+            st.caption("Body sent to OKX:")
+            st.json(_raw.get("body_sent", {}))
+            st.caption("OKX response:")
+            st.json(_raw.get("response", {}))
+            st.caption(f"is_hedge={_raw.get('is_hedge')}  "
+                       f"contracts={_raw.get('contracts','?')}  "
+                       f"ct_val={_raw.get('ct_val','?')}")
+    st.divider()
+
+    st.markdown("**📊 Trade Settings**")
+    c1, c2 = st.columns(2)
+    new_tp = c1.number_input("TP %", min_value=0.1, max_value=20.0, step=0.1, value=float(_snap_cfg["tp_pct"]),    key="cfg_tp")
+    _isolated_active = _snap_cfg.get("trade_margin_mode", "isolated") == "isolated"
+    new_sl = c2.number_input(
+        "SL %", min_value=0.1, max_value=20.0, step=0.1,
+        value=float(_snap_cfg["sl_pct"]), key="cfg_sl",
+        disabled=_isolated_active,
+        help=("SL is the liquidation price in isolated mode (entry × (1 − 1/leverage)). "
+              "Switch to Cross mode to use a custom SL %.")
+        if _isolated_active else "Stop-loss as % below entry."
+    )
+    st.divider()
+
+    # ── F1: Bulk Pre-filter ────────────────────────────────────────────────────
+    st.markdown("**⚡ F1 — Bulk Pre-filter**")
+    new_use_pre_filter = st.checkbox(
+        "Enable F1 — Bulk Pre-filter",
+        value=bool(_snap_cfg.get("use_pre_filter", True)), key="cfg_use_pre_filter",
+        help=(
+            "F1 — Bulk Pre-filter\n\n"
+            "One API call screens the entire watchlist before any candle fetching.\n"
+            "✅ Keeps: 24h Vol ≥ 100,000 USDT  ·  Price ≥ 24h Low × 1.005\n"
+            "❌ Drops: Low-volume coins · Coins hugging the 24h low\n\n"
+            "Disabling forces a full deep-scan of every coin (much slower)."
+        ))
+    if new_use_pre_filter:
+        st.caption("✅ Vol ≥ 100k USDT · Price ≥ 24h Low × 1.005")
+    st.divider()
+
+    # ── F2: PDZ 15m ────────────────────────────────────────────────────────────
+    st.markdown("**🎯 F2 — PDZ Zones** (15m)")
+    new_use_pdz_15m = st.checkbox(
+        "Enable F2 — PDZ Filter (15m)",
+        value=bool(_snap_cfg.get("use_pdz_15m", True)), key="cfg_use_pdz_15m",
+        help=(
+            "F2 — Premium / Discount / Equilibrium Zone Filter (15m)\n\n"
+            "Same DZSAFM zone logic as F3, applied to last 50 × 15m candles.\n\n"
+            "Passing both F3 (5m) and F2 (15m) confirms the coin is in a\n"
+            "favourable Smart Money zone on both timeframes simultaneously.\n\n"
+            "✅ Qualifies: Discount zone · Band A/B with ≥1.5% room to next zone\n"
+            "❌ Rejected:  Equilibrium (indecision) · Premium (no upward room)"
+        ))
+    if new_use_pdz_15m:
+        st.caption("✅ Discount · BandA(≥1.5%↓Premium) · BandB(≥1.5%↓Equilibrium) | ❌ Premium · Equilibrium")
+    st.divider()
+
+    # ── F3: PDZ 5m ─────────────────────────────────────────────────────────────
+    st.markdown("**🎯 F3 — PDZ Zones** (5m)")
+    new_use_pdz_5m = st.checkbox(
+        "Enable F3 — PDZ Filter (5m)",
+        value=bool(_snap_cfg.get("use_pdz_5m", True)), key="cfg_use_pdz_5m",
+        help=(
+            "F3 — Premium / Discount / Equilibrium Zone Filter (5m)\n\n"
+            "DZSAFM Smart Money zones on last 50 × 5m candles.\n"
+            "Zones from swing High (H) and Low (L):\n"
+            "  Premium bottom = 0.95×H + 0.05×L\n"
+            "  Equilibrium    = middle band around midpoint\n"
+            "  Discount top   = 0.05×H + 0.95×L\n\n"
+            "✅ Qualifies: Discount zone · Band A/B with ≥1.5% room to next zone\n"
+            "❌ Rejected:  Equilibrium (indecision) · Premium (no upward room)"
+        ))
+    if new_use_pdz_5m:
+        st.caption("✅ Discount · BandA(≥1.5%↓Premium) · BandB(≥1.5%↓Equilibrium) | ❌ Premium · Equilibrium")
+    st.divider()
+
+    # ── F4: 5m RSI ─────────────────────────────────────────────────────────────
+    st.markdown("**📈 F4 — 5m RSI**")
+    new_use_rsi_5m = st.checkbox(
+        "Enable F4 — 5m RSI",
+        value=bool(_snap_cfg.get("use_rsi_5m", True)), key="cfg_use_rsi_5m",
+        help=(
+            "F4 — 5-Minute RSI Filter\n\n"
+            "RSI(14) on the last 50 × 5m candles must be ≥ the minimum threshold.\n"
+            "This is a fast Stage-1 exit — coins failing here skip all further fetches.\n\n"
+            "A low RSI signals weak short-term momentum — not suitable for a long entry."
+        ))
+    new_rsi5_min = st.number_input("5m RSI min", min_value=0, max_value=100, step=1,
+                                    value=int(_snap_cfg["rsi_5m_min"]), key="cfg_rsi5",
+                                    disabled=not new_use_rsi_5m)
+    st.divider()
+
+    # ── F5: 1h RSI ─────────────────────────────────────────────────────────────
+    st.markdown("**📈 F5 — 1h RSI**")
+    new_use_rsi_1h = st.checkbox(
+        "Enable F5 — 1h RSI",
+        value=bool(_snap_cfg.get("use_rsi_1h", True)), key="cfg_use_rsi_1h",
+        help=(
+            "F5 — 1-Hour RSI Filter\n\n"
+            "RSI(14) on the 1h timeframe must fall within the Min–Max band.\n\n"
+            "Min: ensures real hourly momentum exists (coin is not dead).\n"
+            "Max: avoids entries when the coin is already overbought on the higher timeframe."
+        ))
+    c3, c4 = st.columns(2)
+    new_rsi1h_min = c3.number_input("1h min", min_value=0, max_value=100, step=1,
+                                     value=int(_snap_cfg["rsi_1h_min"]), key="cfg_rsi1h_min",
+                                     disabled=not new_use_rsi_1h)
+    new_rsi1h_max = c4.number_input("1h max", min_value=0, max_value=100, step=1,
+                                     value=int(_snap_cfg["rsi_1h_max"]), key="cfg_rsi1h_max",
+                                     disabled=not new_use_rsi_1h)
+    st.divider()
+
+    # ── F6: EMA Selection ──────────────────────────────────────────────────────
+    st.markdown("**📉 F6 — EMA Selection** (price must be above EMA)",
+                help=(
+                    "F6 — EMA Selection Filter\n\n"
+                    "Entry price must be ABOVE the chosen EMA on each enabled timeframe.\n"
+                    "Being above the EMA confirms the short-term trend is bullish.\n\n"
+                    "Each timeframe (3m, 5m, 15m) is independently toggleable.\n"
+                    "Default EMA period: 12. Adjust per timeframe using the number input."
+                ))
+    ea1, ea2 = st.columns([1,2])
+    new_use_ema_3m    = ea1.checkbox("3m EMA", value=bool(_snap_cfg.get("use_ema_3m",False)), key="cfg_use_ema_3m")
+    new_ema_period_3m = ea2.number_input("P##3m", min_value=2, max_value=500, step=1,
+                                         value=int(_snap_cfg.get("ema_period_3m",12)),
+                                         key="cfg_ema_period_3m", disabled=not new_use_ema_3m,
+                                         label_visibility="collapsed")
+    eb1, eb2 = st.columns([1,2])
+    new_use_ema_5m    = eb1.checkbox("5m EMA", value=bool(_snap_cfg.get("use_ema_5m",True)), key="cfg_use_ema_5m")
+    new_ema_period_5m = eb2.number_input("P##5m", min_value=2, max_value=500, step=1,
+                                         value=int(_snap_cfg.get("ema_period_5m",12)),
+                                         key="cfg_ema_period_5m", disabled=not new_use_ema_5m,
+                                         label_visibility="collapsed")
+    ec1, ec2 = st.columns([1,2])
+    new_use_ema_15m    = ec1.checkbox("15m EMA", value=bool(_snap_cfg.get("use_ema_15m",True)), key="cfg_use_ema_15m")
+    new_ema_period_15m = ec2.number_input("P##15m", min_value=2, max_value=500, step=1,
+                                          value=int(_snap_cfg.get("ema_period_15m",12)),
+                                          key="cfg_ema_period_15m", disabled=not new_use_ema_15m,
+                                          label_visibility="collapsed")
+    st.divider()
+
+    # ── F7: MACD ───────────────────────────────────────────────────────────────
+    _macd_help = (
+        "F7 — MACD Dark Green Histogram Filter\n\n"
+        "Each timeframe is checked independently. Enable only the timeframes you want.\n\n"
+        "For each enabled timeframe ALL of the following must be true:\n"
+        "  • MACD line > 0\n"
+        "  • Signal line > 0\n"
+        "  • Histogram > 0 AND increasing (dark green — not fading)\n"
+        "  • Bullish crossover within the last 12 candles"
+    )
+    st.markdown("**📊 F7 — MACD** (dark 🟢 histogram — per timeframe)", help=_macd_help)
+    fm1, fm2, fm3 = st.columns(3)
+    new_use_macd_3m  = fm1.checkbox("3m MACD",  value=bool(_snap_cfg.get("use_macd_3m",  True)), key="cfg_use_macd_3m")
+    new_use_macd_5m  = fm2.checkbox("5m MACD",  value=bool(_snap_cfg.get("use_macd_5m",  True)), key="cfg_use_macd_5m")
+    new_use_macd_15m = fm3.checkbox("15m MACD", value=bool(_snap_cfg.get("use_macd_15m", True)), key="cfg_use_macd_15m")
+    _macd_on_tfs = [tf for tf, on in [("3m", new_use_macd_3m), ("5m", new_use_macd_5m), ("15m", new_use_macd_15m)] if on]
+    if _macd_on_tfs:
+        st.caption(f"✅ Checking MACD on: {' · '.join(_macd_on_tfs)}  |  MACD>0 · Signal>0 · Histogram 🟢↑ · Crossover ≤12")
+    else:
+        st.caption("⚫ MACD filter disabled (all timeframes off)")
+    st.divider()
+
+    # ── F8: Parabolic SAR ──────────────────────────────────────────────────────
+    _sar_help = (
+        "F8 — Parabolic SAR Filter\n\n"
+        "Each timeframe is checked independently. Enable only the timeframes you want.\n\n"
+        "For each enabled timeframe:\n"
+        "  SAR must be positioned BELOW current price (bullish mode).\n"
+        "  SAR above price = bearish trend → coin rejected on that timeframe."
+    )
+    st.markdown("**🪂 F8 — Parabolic SAR** (per timeframe)", help=_sar_help)
+    fs1, fs2, fs3 = st.columns(3)
+    new_use_sar_3m  = fs1.checkbox("3m SAR",  value=bool(_snap_cfg.get("use_sar_3m",  True)), key="cfg_use_sar_3m")
+    new_use_sar_5m  = fs2.checkbox("5m SAR",  value=bool(_snap_cfg.get("use_sar_5m",  True)), key="cfg_use_sar_5m")
+    new_use_sar_15m = fs3.checkbox("15m SAR", value=bool(_snap_cfg.get("use_sar_15m", True)), key="cfg_use_sar_15m")
+    _sar_on_tfs = [tf for tf, on in [("3m", new_use_sar_3m), ("5m", new_use_sar_5m), ("15m", new_use_sar_15m)] if on]
+    if _sar_on_tfs:
+        st.caption(f"✅ Checking SAR on: {' · '.join(_sar_on_tfs)}  |  SAR must be below price (bullish)")
+    else:
+        st.caption("⚫ SAR filter disabled (all timeframes off)")
+    st.divider()
+
+    # ── F9: Volume Spike ───────────────────────────────────────────────────────
+    st.markdown("**📦 F9 — Volume Spike** (15m)")
+    new_use_vol_spike = st.checkbox(
+        "Enable F9 — Volume Spike",
+        value=bool(_snap_cfg.get("use_vol_spike",False)), key="cfg_use_vol_spike",
+        help=(
+            "F9 — Volume Spike Filter (disabled by default)\n\n"
+            "Most recent 15m candle volume must be ≥ Mult × average of prior Lookback candles.\n\n"
+            "Confirms strong buying pressure behind the move.\n"
+            "Mult: spike multiplier (e.g. 2.0 = must be 2× average).\n"
+            "Lookback: number of prior candles used to compute the average."
+        ))
+    vx1, vx2 = st.columns(2)
+    new_vol_mult     = vx1.number_input("Mult (X×)", min_value=1.0, max_value=20.0, step=0.5,
+                                         value=float(_snap_cfg.get("vol_spike_mult",2.0)), key="cfg_vol_mult",
+                                         disabled=not new_use_vol_spike)
+    new_vol_lookback = vx2.number_input("Lookback (N)", min_value=2, max_value=100, step=1,
+                                         value=int(_snap_cfg.get("vol_spike_lookback",20)), key="cfg_vol_lookback",
+                                         disabled=not new_use_vol_spike)
+    st.divider()
+
+    st.markdown("**⏱ Execution**")
+    c5, c6 = st.columns(2)
+    new_loop = c5.number_input("Loop (min)", min_value=1, max_value=60, step=1, value=int(_snap_cfg["loop_minutes"]),    key="cfg_loop")
+    new_cool = c6.number_input("Cooldown (min)", min_value=1, max_value=120, step=1, value=int(_snap_cfg["cooldown_minutes"]), key="cfg_cool")
+    st.divider()
+
+    st.markdown("**📋 Watchlist** (one symbol per line)")
+    wl_text = st.text_area("wl", value="\n".join(_snap_cfg["watchlist"]),
+                            height=180, label_visibility="collapsed", key="cfg_wl")
+
+    # Highlight any watchlist coins absent from the OKX live SWAP instrument list
+    _ct_cache = _b._bsc_symbol_cache.get("ct_val", {})
+    if _ct_cache:
+        _wl_delisted = [s for s in _snap_cfg.get("watchlist", [])
+                        if s not in _ct_cache]
+        if _wl_delisted:
+            st.warning(
+                f"⚠️ {len(_wl_delisted)} coin(s) not found as live OKX SWAP instruments "
+                f"(delisted or wrong ticker) — trades will be skipped for these:\n\n"
+                + ", ".join(_wl_delisted)
+            )
+    st.divider()
+
+    st.markdown("**💾 Data Storage**")
+    _is_temp = str(_SCRIPT_DIR).startswith(str(pathlib.Path(__import__("tempfile").gettempdir())))
+    if _is_temp:
+        st.warning(
+            f"⚠️ Saving to **temp directory** — data will be lost on OS restart!\n\n"
+            f"`{_SCRIPT_DIR}`\n\n"
+            "Move the script to a writable folder (e.g. Documents) to fix this.")
+    else:
+        st.caption(f"📁 Data folder: `{_SCRIPT_DIR}`")
+        st.caption(f"  • `scanner_log.json` — all signals (loaded on restart)")
+        st.caption(f"  • `scanner_config.json` — filters, API keys, settings")
+    st.divider()
+
+    st.markdown("**🗑 Clear History**")
+    if st.button("⚡ Flush All", use_container_width=True, type="secondary"):
+        # 1 — signals + health log
+        with _log_lock:
+            _b._bsc_log["signals"] = []
+            _b._bsc_log["health"]  = {
+                "total_cycles": 0, "last_scan_at": None,
+                "last_scan_duration_s": 0.0, "total_api_errors": 0,
+                "watchlist_size": 0, "pre_filtered_out": 0, "deep_scanned": 0,
+            }
+            save_log(_b._bsc_log)
+        # 2 — filter funnel (use _reset_filter_counts so the in-place dict
+        #     is reinitialised to zero-state, keeping the same object reference
+        #     that the scanner thread uses — avoids the split-reference bug)
+        _reset_filter_counts()
+        # 3 — API error log
+        with getattr(_b, "_bsc_error_log_lock", threading.Lock()):
+            if hasattr(_b, "_bsc_error_log"):
+                _b._bsc_error_log.clear()
+        # 4 — last trade debug panel + manual/test trade session results
+        _b._bsc_last_trade_raw = {}
+        _b._bsc_last_error     = ""
+        for _ss_key in ("_mt_last_result", "_test_trade_result"):
+            st.session_state.pop(_ss_key, None)
+        st.success("✅ Flushed"); st.rerun()
+
+    cd1, cd2 = st.columns(2)
+    if cd1.button("📅 Clear 24h", use_container_width=True):
+        cutoff = dubai_now() - timedelta(hours=24)
+        with _log_lock:
+            before = len(_b._bsc_log["signals"])
+            _b._bsc_log["signals"] = [s for s in _b._bsc_log["signals"]
+                if datetime.fromisoformat(s["timestamp"].replace("Z","+00:00")) < cutoff]
+            save_log(_b._bsc_log)
+        st.success(f"✅ Removed {before-len(_b._bsc_log['signals'])}"); st.rerun()
+    if cd2.button("📆 Clear 7d", use_container_width=True):
+        cutoff = dubai_now() - timedelta(days=7)
+        with _log_lock:
+            before = len(_b._bsc_log["signals"])
+            _b._bsc_log["signals"] = [s for s in _b._bsc_log["signals"]
+                if datetime.fromisoformat(s["timestamp"].replace("Z","+00:00")) < cutoff]
+            save_log(_b._bsc_log)
+        st.success(f"✅ Removed {before-len(_b._bsc_log['signals'])}"); st.rerun()
+    st.divider()
+
+    if st.button("↩️ Reset Defaults", use_container_width=True, type="secondary"):
+        d = dict(DEFAULT_CONFIG)
+        with _config_lock: _b._bsc_cfg.clear(); _b._bsc_cfg.update(d)
+        save_config(d)
+        # Also invalidate symbol cache so it re-verifies on next scan
+        _b._bsc_symbol_cache["fetched_at"] = 0
+        st.success("✅ Reset"); st.rerun()
+
+    if st.button("💾 Save & Apply", use_container_width=True, type="primary"):
+        new_wl = [s.strip().upper() for s in wl_text.splitlines() if s.strip()]
+        new_cfg = {
+            "tp_pct": new_tp, "sl_pct": new_sl,
+            # enable/disable flags
+            "use_pre_filter":      bool(new_use_pre_filter),
+            "use_rsi_5m":          bool(new_use_rsi_5m),
+            "use_rsi_1h":          bool(new_use_rsi_1h),
+            # filter parameters
+            "rsi_5m_min": int(new_rsi5_min),
+            "rsi_1h_min": int(new_rsi1h_min), "rsi_1h_max": int(new_rsi1h_max),
+            "loop_minutes": int(new_loop), "cooldown_minutes": int(new_cool),
+            "use_ema_3m": bool(new_use_ema_3m), "ema_period_3m": int(new_ema_period_3m),
+            "use_ema_5m": bool(new_use_ema_5m), "ema_period_5m": int(new_ema_period_5m),
+            "use_ema_15m": bool(new_use_ema_15m), "ema_period_15m": int(new_ema_period_15m),
+            "use_macd_3m":  bool(new_use_macd_3m),
+            "use_macd_5m":  bool(new_use_macd_5m),
+            "use_macd_15m": bool(new_use_macd_15m),
+            "use_sar_3m":   bool(new_use_sar_3m),
+            "use_sar_5m":   bool(new_use_sar_5m),
+            "use_sar_15m":  bool(new_use_sar_15m),
+            "use_vol_spike": bool(new_use_vol_spike),
+            "vol_spike_mult": float(new_vol_mult), "vol_spike_lookback": int(new_vol_lookback),
+            "use_pdz_5m": bool(new_use_pdz_5m),
+            "use_pdz_15m": bool(new_use_pdz_15m),
+            "watchlist": new_wl,
+            # ── Auto-trading ─────────────────────────────────────────────────
+            "trade_enabled":     bool(new_trade_enabled),
+            "demo_mode":         (new_demo_mode == "Demo"),
+            "api_key":           new_api_key.strip(),
+            "api_secret":        new_api_secret.strip(),
+            "api_passphrase":    new_api_passphrase.strip(),
+            "trade_usdt_amount": float(new_trade_usdt),
+            "trade_leverage":    int(new_trade_lev),
+            "trade_margin_mode": new_margin_mode,
+        }
+        with _config_lock: _b._bsc_cfg.clear(); _b._bsc_cfg.update(new_cfg)
+        save_config(new_cfg)
+        # Invalidate symbol cache if watchlist changed
+        if new_wl != _snap_cfg.get("watchlist", []):
+            _b._bsc_symbol_cache["fetched_at"] = 0
+        _b._bsc_rescan_event.set()   # wake bg thread immediately — no waiting for next cycle
+        st.success(f"✅ Saved — {len(new_wl)} coins — rescanning now…"); st.rerun()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN AREA
+# ─────────────────────────────────────────────────────────────────────────────
+st.title("S&R — Crypto Intelligent System, By Trends and Trade")
+
+last_scan = health.get("last_scan_at", "never")
+if last_scan and last_scan != "never":
+    try:
+        ts       = datetime.fromisoformat(last_scan.replace("Z","+00:00"))
+        ts_dubai = to_dubai(ts)
+        ago      = int((dubai_now()-ts_dubai).total_seconds()/60)
+        last_scan = f"{ago}m ago  ({ts_dubai.strftime('%H:%M')} GST)"
+    except Exception: pass
+
+col_h1, col_h2, col_h3 = st.columns([3, 1, 1])
+col_h1.caption(f"Last scan: {last_scan}   |   Auto-refresh every 30 s   |   🕐 Dubai / GST (UTC+4)")
+if col_h2.button("🔄 Refresh", key="manual_refresh"): st.rerun()
+
+# ── API connection status badge ───────────────────────────────────────────────
+_api_cs   = getattr(_b, "_bsc_api_conn_status",
+                    {"status": "untested", "message": "", "tested_at": None,
+                     "demo_mode": None, "uid": ""})
+_api_stat = _api_cs.get("status", "untested")
+_trade_on = _snap_cfg.get("trade_enabled", False)
+if not _trade_on:
+    _badge = "⚫ Auto-Trade: Off"
+    col_h3.caption(_badge)
+elif _api_stat == "ok":
+    _env_lbl = "Demo" if _api_cs.get("demo_mode") else "Live"
+    _badge   = f"🟢 API: {_env_lbl}"
+    col_h3.caption(_badge)
+elif _api_stat == "error":
+    col_h3.caption("🔴 API: Error")
+else:
+    col_h3.caption("🟡 API: Untested")
+
+if _trade_on and _api_stat == "ok":
+    _tested_str = fmt_dubai(_api_cs.get("tested_at", "")) if _api_cs.get("tested_at") else "—"
+    st.caption(f"🤖 Auto-Trading active · {_api_cs.get('message','')} · tested {_tested_str}")
+
+# ── Health metrics ─────────────────────────────────────────────────────────────
+open_count  = sum(1 for s in signals if s["status"]=="open")
+tp_count    = sum(1 for s in signals if s["status"]=="tp_hit")
+sl_count    = sum(1 for s in signals if s["status"]=="sl_hit")
+queue_count = sum(1 for s in signals if s["status"]=="queue_limit")
+
+# ── Warn if log loaded from a previous session already exceeds the 15-trade cap
+# (e.g. migrating from v1 which had no limit).  No new trades will fire until
+# open_count drops below 15 via TP or SL hits.
+if open_count > 15:
+    st.warning(
+        f"⚠️ **{open_count} open trades detected** — this exceeds the 15-trade limit "
+        f"(likely loaded from a log created before the queue-limit was enforced). "
+        f"No new trades will be opened until the open count drops below 15 via TP or SL hits. "
+        f"You can also use **Clear History** in the sidebar to reset the log."
+    )
+pre_out     = health.get("pre_filtered_out", 0)
+deep_sc     = health.get("deep_scanned",     0)
+
+m1,m2,m3,m4,m5c,m6,m7,m8,m9 = st.columns(9)
+m1.metric("Cycles",        health.get("total_cycles",0))
+m2.metric("Scan Time",     f"{health.get('last_scan_duration_s',0)}s")
+m3.metric("API Errors",    health.get("total_api_errors",0))
+m4.metric("Pre-filtered ⚡", pre_out, help="Coins removed by bulk ticker pre-filter (saves API calls)")
+m5c.metric("Deep Scanned", deep_sc, help="Coins that passed pre-filter and received full candle analysis")
+m6.metric("Open",          open_count,  help="Active open trades (max 15 allowed simultaneously)")
+m7.metric("TP Hit ✅",     tp_count)
+m8.metric("SL Hit ❌",     sl_count)
+m9.metric("⏳ Queued",     queue_count, help="Signals detected while 15-trade limit was reached — no order placed, coin rescanned each cycle")
+
+if getattr(_b, "_bsc_last_error", ""):
+    st.warning(f"⚠️ {_b._bsc_last_error}")
+
+# ── Active filter badges ───────────────────────────────────────────────────────
+badges = []
+if _snap_cfg.get("use_pdz_15m", True): badges.append(f"🎯 F2 — PDZ 15m")
+if _snap_cfg.get("use_pdz_5m",  True): badges.append(f"🎯 F3 — PDZ 5m")
+if _snap_cfg.get("use_rsi_5m",  True): badges.append(f"📈 F4 — 5m RSI ≥{_snap_cfg.get('rsi_5m_min',30)}")
+if _snap_cfg.get("use_rsi_1h",  True): badges.append(f"📈 F5 — 1h RSI {_snap_cfg.get('rsi_1h_min',30)}–{_snap_cfg.get('rsi_1h_max',95)}")
+if _snap_cfg.get("use_ema_3m"):    badges.append(f"📉 F6 — EMA{_snap_cfg.get('ema_period_3m',12)} 3m")
+if _snap_cfg.get("use_ema_5m"):    badges.append(f"📉 F6 — EMA{_snap_cfg.get('ema_period_5m',12)} 5m")
+if _snap_cfg.get("use_ema_15m"):   badges.append(f"📉 F6 — EMA{_snap_cfg.get('ema_period_15m',12)} 15m")
+_macd_tfs = [tf for tf, k in [("3m","use_macd_3m"),("5m","use_macd_5m"),("15m","use_macd_15m")] if _snap_cfg.get(k, True)]
+if _macd_tfs: badges.append(f"📊 F7 — MACD 🟢↑ {' · '.join(_macd_tfs)}")
+_sar_tfs  = [tf for tf, k in [("3m","use_sar_3m"), ("5m","use_sar_5m"), ("15m","use_sar_15m")] if _snap_cfg.get(k, True)]
+if _sar_tfs:  badges.append(f"🪂 F8 — SAR {' · '.join(_sar_tfs)}")
+if _snap_cfg.get("use_vol_spike"): badges.append(
+    f"📦 F9 — Vol ≥{_snap_cfg.get('vol_spike_mult',2.0)}× / {_snap_cfg.get('vol_spike_lookback',20)} 15m")
+st.markdown("**Active Filters:**")
+st.caption("  |  ".join(badges) if badges else "No advanced filters enabled")
+st.divider()
+
+# ── Sector filter ──────────────────────────────────────────────────────────────
+all_sectors = ["All","BTC","L1","L2","DeFi","AI","Privacy","Meme","Gaming","Other"]
+if "sector_filter" not in st.session_state: st.session_state["sector_filter"] = "All"
+scols = st.columns(len(all_sectors))
+for i, sec in enumerate(all_sectors):
+    active = st.session_state["sector_filter"] == sec
+    if scols[i].button(sec, key=f"sec_{sec}", type="primary" if active else "secondary",
+                        use_container_width=True):
+        st.session_state["sector_filter"] = sec; st.rerun()
+selected_sector = st.session_state["sector_filter"]
+
+# ── Shared helpers for row building ────────────────────────────────────────────
+def _cv(v):
+    """Format a criteria value: numeric → compact float, else as-is."""
+    if v is None or v == "—" or v == "✅": return "—"
+    try: return f"{float(v):.6f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError): return str(v)
+
+def _fmt_secs(secs: int) -> str:
+    if secs < 0:   return "—"
+    if secs < 3600: return f"{secs // 60}m {secs % 60}s"
+    if secs < 86400:
+        h, rem = divmod(secs, 3600); return f"{h}h {rem // 60}m"
+    d, rem = divmod(secs, 86400);   return f"{d}d {rem // 3600}h"
+
+def _build_signal_row(s: dict) -> dict:
+    """Convert one signal dict into a table row dict (all columns)."""
+    status      = s.get("status", "open")
+    status_icon = {
+        "open":        "🔵 Open",
+        "tp_hit":      "✅ TP Hit",
+        "sl_hit":      "❌ SL Hit",
+        "queue_limit": "⏳ Queue Limit",
+    }.get(status, status)
+
+    # Alert column — only meaningful for open trades
+    alert_col = ""
+    if status == "open":
+        _dl = s.get("price_alert", False)
+        _tl = False
+        if s.get("timestamp"):
+            try:
+                _t_open = datetime.fromisoformat(s["timestamp"].replace("Z", "+00:00"))
+                _tl = (dubai_now() - _t_open).total_seconds() >= 7200
+            except Exception:
+                pass
+        if _dl and _tl:   alert_col = "🔴 DL / TL"
+        elif _dl:          alert_col = "🔴 DL"
+        elif _tl:          alert_col = "🔴 TL"
+
+    ts_str    = fmt_dubai(s.get("timestamp", ""))
+    close_str = fmt_dubai(s["close_time"]) if s.get("close_time") else "—"
+    crit      = s.get("criteria", {})
+    pdz_5m_val  = crit.get("pdz_zone_5m",  "—") or "—"
+    pdz_15m_val = crit.get("pdz_zone_15m", "—") or "—"
+    crit_str = (
+        f"• RSI 5m    : {crit.get('rsi_5m','—')}\n"
+        f"• RSI 1h    : {crit.get('rsi_1h','—')}\n"
+        f"• EMA 3m    : {_cv(crit.get('ema_3m','—'))}\n"
+        f"• EMA 5m    : {_cv(crit.get('ema_5m','—'))}\n"
+        f"• EMA 15m   : {_cv(crit.get('ema_15m','—'))}\n"
+        f"• MACD 3m   : {_cv(crit.get('macd_3m'))}\n"
+        f"• MACD 5m   : {_cv(crit.get('macd_5m'))}\n"
+        f"• MACD 15m  : {_cv(crit.get('macd_15m'))}\n"
+        f"• SAR 3m    : {_cv(crit.get('sar_3m'))}\n"
+        f"• SAR 5m    : {_cv(crit.get('sar_5m'))}\n"
+        f"• SAR 15m   : {_cv(crit.get('sar_15m'))}\n"
+        f"• Vol ×avg  : {_cv(crit.get('vol_ratio'))}\n"
+        f"• PDZ 5m    : {pdz_5m_val}\n"
+        f"• PDZ 15m   : {pdz_15m_val}"
+    ) if crit else "—"
+
+    max_lev   = s.get("max_lev", get_max_leverage(s.get("symbol", "")))
+    sl_reason = analyze_sl_reason(s) if status == "sl_hit" else "—"
+    setup_type = "⭐ Super" if s.get("is_super_setup") else "Normal"
+
+    _usdt    = float(s.get("trade_usdt", _snap_cfg.get("trade_usdt_amount", 0)))
+    _lev     = int(s.get("trade_lev",   _snap_cfg.get("trade_leverage", 10)))
+    _entry_p = float(s.get("entry", 0) or 0)
+    _tp_p    = float(s.get("tp",    0) or 0)
+    _sl_p    = float(s.get("sl",    0) or 0)
+    if _usdt > 0 and _lev > 0 and _entry_p > 0:
+        _pos = _usdt * _lev
+        tp_usd_str = f"+${_pos * (_tp_p - _entry_p) / _entry_p:.2f}"
+        sl_usd_str = f"-${_pos * (_entry_p - _sl_p) / _entry_p:.2f}"
+    else:
+        tp_usd_str = sl_usd_str = "—"
+
+    ord_id_str  = s.get("order_id", "") or "—"
+    algo_id_str = s.get("algo_id",  "") or "—"
+    ord_env     = "🟡 Demo" if s.get("demo_mode") else "🔴 Live"
+    ord_status  = s.get("order_status", "")
+    ord_err     = s.get("order_error",  "")
+    if   ord_status == "placed":  ord_status_str = f"✅ Entry+OCO {ord_env}"
+    elif ord_status == "partial": ord_status_str = f"⚠️ Entry only {ord_env} · {ord_err[:80]}"
+    elif ord_status == "error":   ord_status_str = f"❌ {ord_err[:80]}" if ord_err else "❌ Error"
+    else:                         ord_status_str = "—"
+
+    # ── OKX Command column — shows exact parameters sent to OKX ──────────────
+    _ord_sz      = int(s.get("order_sz", 0) or 0)
+    _ct_val      = float(s.get("order_ct_val", 0) or 0)
+    _notional    = float(s.get("order_notional", 0) or 0)
+    _margin_mode = s.get("order_margin_mode", "") or "cross"
+    _is_hedge    = bool(s.get("order_is_hedge", False))
+    if not _notional and _usdt > 0 and _lev > 0:
+        _notional = _usdt * _lev   # reconstruct for older signals without stored notional
+    if status == "queue_limit":
+        okx_cmd_str = "No order placed — Queue Limit"
+    elif _usdt > 0 or _ord_sz > 0:
+        _sym_okx = _to_okx(s.get("symbol", ""))
+        _ps_part = " | posSide: long" if _is_hedge else ""
+        _ct_part = f" | ctVal: {_ct_val}" if _ct_val else ""
+        okx_cmd_str = (
+            f"instId: {_sym_okx} | ordType: market"
+            f" | tdMode: {_margin_mode}{_ps_part}"
+            f" | sz: {_ord_sz} contracts"
+            f" | collateral: ${_usdt:.2f} | lev: {_lev}×"
+            f" | notional: ${_notional:.2f}{_ct_part}"
+        )
+    else:
+        okx_cmd_str = "—"
+
+    duration_str = "—"
+    if s.get("timestamp"):
+        try:
+            t_open = datetime.fromisoformat(s["timestamp"].replace("Z", "+00:00"))
+            if status == "open":
+                duration_str = _fmt_secs(int((dubai_now() - t_open).total_seconds()))
+            elif s.get("close_time"):
+                t_close = datetime.fromisoformat(s["close_time"].replace("Z", "+00:00"))
+                duration_str = _fmt_secs(int((t_close - t_open).total_seconds()))
+        except Exception:
+            pass
+
+    return {
+        "Time (GST)":     ts_str,
+        "Alert":          alert_col,
+        "Symbol":         s.get("symbol", ""),
+        "Setup":          setup_type,
+        "Sector":         s.get("sector", "Other"),
+        "Signal Entry":   s.get("signal_entry", s.get("entry", "")),
+        "Fill $":         s.get("entry", "") if s.get("signal_entry") else "—",
+        "TP":             s.get("tp", ""),
+        "TP $":           tp_usd_str,
+        "SL":             s.get("sl", ""),
+        "SL $":           sl_usd_str,
+        "Status":         status_icon,
+        "Duration":       duration_str,
+        "Close Time":     close_str,
+        "Close $":        s.get("close_price") or "—",
+        "Max Lev":        f"{max_lev}×",
+        "Order":          ord_status_str,
+        "OKX Command":    okx_cmd_str,
+        "Order ID":       ord_id_str,
+        "Algo ID":        algo_id_str,
+        "Entry Criteria": crit_str,
+        "⚠️ SL Reason":  sl_reason,
+    }
+
+# Shared column_config used by all four tables
+_SIG_COL_CFG = {
+    "Alert":          st.column_config.TextColumn(
+                          "🚨 Alert", width="small",
+                          help="🔴 DL = price ≥3% below entry  |  🔴 TL = open ≥2 hours"),
+    "Setup":          st.column_config.TextColumn(width="small"),
+    "Signal Entry":   st.column_config.NumberColumn(format="%.8f",
+                          help="Price when the scanner signal fired"),
+    "Fill $":         st.column_config.NumberColumn(format="%.8f",
+                          help="Actual market fill price (may differ from signal entry)"),
+    "TP":             st.column_config.NumberColumn(format="%.8f"),
+    "TP $":           st.column_config.TextColumn(width="small"),
+    "SL":             st.column_config.NumberColumn(format="%.8f"),
+    "SL $":           st.column_config.TextColumn(width="small"),
+    "Duration":       st.column_config.TextColumn(width="small"),
+    "Close Time":     st.column_config.TextColumn(width="small"),
+    "Max Lev":        st.column_config.TextColumn(width="small"),
+    "Order":          st.column_config.TextColumn(width="medium"),
+    "OKX Command":    st.column_config.TextColumn(
+                          "OKX Command",
+                          width="large",
+                          help="Exact parameters sent to OKX when the order was placed. "
+                               "Collateral = your USDT setting. "
+                               "Notional = collateral × leverage (this is what OKX shows as position size)."),
+    "Order ID":       st.column_config.TextColumn(width="medium"),
+    "Algo ID":        st.column_config.TextColumn(width="medium"),
+    "Entry Criteria": st.column_config.TextColumn(width="medium"),
+    "⚠️ SL Reason":  st.column_config.TextColumn(width="medium"),
+}
+
+def _render_sig_table(sig_list: list, header: str, empty_msg: str,
+                      auto_height: bool = False):
+    rows = [_build_signal_row(s) for s in sig_list]
+    st.markdown(f"### {header} ({len(rows)})")
+    if rows:
+        if auto_height:
+            # Expand so ALL rows are visible without internal scrolling.
+            # Each row ≈ 35 px, header ≈ 38 px, +10 px buffer.
+            st.dataframe(rows, use_container_width=True, hide_index=True,
+                         height=len(rows) * 35 + 48,
+                         column_config=_SIG_COL_CFG)
+        else:
+            st.dataframe(rows, use_container_width=True, hide_index=True,
+                         column_config=_SIG_COL_CFG)
+    else:
+        st.info(empty_msg)
+
+# ── Filter by sector then split into four status buckets ───────────────────────
+filtered = signals if selected_sector == "All" else \
+           [s for s in signals if s.get("sector") == selected_sector]
+filtered_sorted = sorted(filtered, key=lambda x: x.get("timestamp", ""), reverse=True)
+
+_open_sigs  = [s for s in filtered_sorted if s.get("status") == "open"]
+_tp_sigs    = [s for s in filtered_sorted if s.get("status") == "tp_hit"]
+_sl_sigs    = [s for s in filtered_sorted if s.get("status") == "sl_hit"]
+_queue_sigs = [s for s in filtered_sorted if s.get("status") == "queue_limit"]
+
+# ── Table 1: Open Signals ───────────────────────────────────────────────────────
+_render_sig_table(_open_sigs,  "🔵 Open Signals",  "No open signals right now.",
+                  auto_height=True)
+st.divider()
+
+# ── Table 2: TP Hit ─────────────────────────────────────────────────────────────
+_render_sig_table(_tp_sigs,    "✅ TP Hit",         "No TP hits yet.")
+st.divider()
+
+# ── Table 3: SL Hit ─────────────────────────────────────────────────────────────
+_render_sig_table(_sl_sigs,    "❌ SL Hit",         "No SL hits yet.")
+st.divider()
+
+# ── Table 4: Queue Limit ────────────────────────────────────────────────────────
+_render_sig_table(_queue_sigs, "⏳ Queue Limit",    "No queued signals.")
+
+if _queue_sigs:
+    if st.button("🗑️ Clear Queue Limit Records", key="clear_queue_limit"):
+        with _log_lock:
+            _b._bsc_log["signals"] = [
+                s for s in _b._bsc_log["signals"]
+                if s.get("status") != "queue_limit"
+            ]
+            save_log(_b._bsc_log)
+        st.success("✅ Queue Limit records cleared.")
+        st.rerun()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OKX Live Positions Panel
+# ─────────────────────────────────────────────────────────────────────────────
+_has_api_creds = bool(
+    _snap_cfg.get("api_key") and _snap_cfg.get("api_secret")
+    and _snap_cfg.get("api_passphrase")
+)
+
+st.divider()
+with st.expander("📡 OKX Live Positions", expanded=False):
+    if not _has_api_creds:
+        st.warning("Enter API credentials in the sidebar to use this panel.")
+    else:
+        _env_label = "🟡 Demo" if _snap_cfg.get("demo_mode", True) else "🔴 Live"
+        _col_btn, _col_info = st.columns([1, 4])
+        with _col_btn:
+            _do_refresh = st.button("🔄 Refresh from OKX", key="refresh_okx_live")
+        with _col_info:
+            _last_ts = st.session_state.get("okx_pos_ts", "")
+            if _last_ts:
+                st.caption(f"Last fetched: {_last_ts}  ·  {_env_label}")
+            else:
+                st.caption(f"Press Refresh to load live data directly from OKX  ·  {_env_label}")
+
+        if _do_refresh:
+            try:
+                _pos_resp  = _trade_get("/api/v5/account/positions",
+                                        {"instType": "SWAP"}, _snap_cfg)
+                _algo_resp = _trade_get("/api/v5/trade/orders-algo-pending",
+                                        {"instType": "SWAP", "ordType": "oco"},
+                                        _snap_cfg)
+                st.session_state["okx_pos_data"]  = _pos_resp
+                st.session_state["okx_algo_data"] = _algo_resp
+                st.session_state["okx_pos_ts"]    = \
+                    dubai_now().strftime("%d %b %Y  %H:%M:%S GST")
+                st.rerun()
+            except Exception as _refresh_exc:
+                st.error(f"❌ OKX API error: {_refresh_exc}")
+
+        _pos_data  = st.session_state.get("okx_pos_data")
+        _algo_data = st.session_state.get("okx_algo_data")
+
+        if _pos_data is None:
+            st.info("No data yet — press **🔄 Refresh from OKX** above.")
+        else:
+            # ── Positions table ───────────────────────────────────────────
+            st.markdown("#### 📊 Open Positions")
+            if _pos_data.get("code") != "0":
+                st.error(f"OKX error: {_pos_data.get('msg', 'Unknown error')}")
+            else:
+                _positions = _pos_data.get("data", [])
+                if _positions:
+                    _pos_rows = []
+                    for _p in _positions:
+                        _upnl     = float(_p.get("upl",      0) or 0)
+                        _upnl_pct = float(_p.get("uplRatio", 0) or 0) * 100
+                        _liq_raw  = float(_p.get("liqPx",    0) or 0)
+                        # OKX: 'margin' is only populated in Isolated mode.
+                        # In Cross mode use 'imr' (Initial Margin Requirement).
+                        _margin_isolated = float(_p.get("margin", 0) or 0)
+                        _margin_imr      = float(_p.get("imr",    0) or 0)
+                        _margin_display  = _margin_isolated if _margin_isolated > 0 else _margin_imr
+                        _mgn_mode        = _p.get("mgnMode", "cross")
+                        _margin_label    = f"{'IMR' if _mgn_mode == 'cross' else 'Margin'} $"
+                        _pos_rows.append({
+                            "Symbol":        _p.get("instId", ""),
+                            "Side":          _p.get("posSide", "net").capitalize(),
+                            "Mode":          _mgn_mode.capitalize(),
+                            "Contracts":     int(_p.get("pos", 0) or 0),
+                            "Avg Entry":     float(_p.get("avgPx",       0) or 0),
+                            "Mark Price":    float(_p.get("markPx",      0) or 0),
+                            "Unreal PnL":    round(_upnl, 4),
+                            "PnL %":         f"{_upnl_pct:+.2f}%",
+                            "Notional $":    round(float(_p.get("notionalUsd", 0) or 0), 2),
+                            "IMR / Margin $": round(_margin_display, 4),
+                            "Leverage":      f"{_p.get('lever', '')}×",
+                            "Liq Price":     _liq_raw if _liq_raw > 0 else "—",
+                        })
+                    st.dataframe(
+                        _pos_rows,
+                        use_container_width=True,
+                        hide_index=True,
+                        height=len(_pos_rows) * 35 + 48,
+                        column_config={
+                            "Avg Entry":       st.column_config.NumberColumn(format="%.6f"),
+                            "Mark Price":      st.column_config.NumberColumn(format="%.6f"),
+                            "Liq Price":       st.column_config.NumberColumn(format="%.6f"),
+                            "Unreal PnL":      st.column_config.NumberColumn(
+                                                   "Unreal PnL $", format="%.4f"),
+                            "IMR / Margin $":  st.column_config.NumberColumn(
+                                                   "IMR / Margin $", format="%.4f",
+                                                   help="Cross margin → IMR (Initial Margin Requirement). "
+                                                        "Isolated margin → Margin held per position."),
+                        },
+                    )
+                else:
+                    st.info("No open SWAP positions on OKX right now.")
+
+            # ── Active OCO Algo Orders table ──────────────────────────────
+            st.markdown("#### 🎯 Active TP/SL Orders (OCO)")
+            _algo_code = (_algo_data or {}).get("code", "")
+            if _algo_code and _algo_code != "0":
+                st.error(f"OKX algo error: {(_algo_data or {}).get('msg', '')}")
+            else:
+                _algos = (_algo_data or {}).get("data", [])
+                if _algos:
+                    _algo_rows = []
+                    for _a in _algos:
+                        # OKX returns cTime as Unix ms string
+                        _ct_ms = int(_a.get("cTime", 0) or 0)
+                        try:
+                            from datetime import timezone
+                            _ct_str = datetime.fromtimestamp(
+                                _ct_ms / 1000, tz=timezone.utc
+                            ).astimezone(
+                                __import__("zoneinfo").ZoneInfo("Asia/Dubai")
+                            ).strftime("%d %b %H:%M:%S")
+                        except Exception:
+                            _ct_str = str(_ct_ms)
+                        _algo_rows.append({
+                            "Symbol":     _a.get("instId", ""),
+                            "Algo ID":    _a.get("algoId", ""),
+                            "Contracts":  int(_a.get("sz", 0) or 0),
+                            "TP Trigger": float(_a.get("tpTriggerPx", 0) or 0) or "—",
+                            "SL Trigger": float(_a.get("slTriggerPx", 0) or 0) or "—",
+                            "State":      _a.get("state", ""),
+                            "Created":    _ct_str,
+                        })
+                    st.dataframe(
+                        _algo_rows,
+                        use_container_width=True,
+                        hide_index=True,
+                        height=len(_algo_rows) * 35 + 48,
+                        column_config={
+                            "TP Trigger": st.column_config.NumberColumn(format="%.6f"),
+                            "SL Trigger": st.column_config.NumberColumn(format="%.6f"),
+                        },
+                    )
+                else:
+                    st.info("No active OCO algo orders on OKX right now.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Manual Trade Panel
+# ─────────────────────────────────────────────────────────────────────────────
+_mt_has_creds = bool(
+    _snap_cfg.get("api_key") and _snap_cfg.get("api_secret")
+    and _snap_cfg.get("api_passphrase") and _snap_cfg.get("trade_enabled")
+)
+
+with st.expander("🤖 Manual Trade", expanded=False):
+    if not _mt_has_creds:
+        st.warning("Enable Auto-Trading and enter API credentials in the sidebar first.")
+    else:
+        st.caption("Place a trade manually on any coin. Use this to debug order errors — "
+                   "the full OKX request and response are shown immediately below.")
+
+        # ── Coin selector ─────────────────────────────────────────────────────
+        # Pre-populate with open signals that have no order yet (or any signal)
+        _sig_syms  = [s["symbol"] for s in signals if s.get("status") == "open"]
+        _wl_syms   = _snap_cfg.get("watchlist", [])
+        _all_syms  = sorted(set(_sig_syms + _wl_syms))
+        _mt_default = _sig_syms[0] if _sig_syms else (_all_syms[0] if _all_syms else "BTCUSDT")
+
+        mt_col1, mt_col2 = st.columns([2, 1])
+        mt_sym = mt_col1.selectbox(
+            "Symbol", _all_syms,
+            index=_all_syms.index(_mt_default) if _mt_default in _all_syms else 0,
+            key="mt_sym")
+        mt_mode = mt_col2.selectbox(
+            "Margin mode", ["isolated", "cross"],
+            index=0 if _snap_cfg.get("trade_margin_mode","isolated") == "isolated" else 1,
+            key="mt_mode")
+
+        # ── Auto-fill from existing open signal if available ──────────────────
+        _mt_sig = next((s for s in signals
+                        if s["symbol"] == mt_sym and s["status"] == "open"), None)
+        _mt_entry_def = float(_mt_sig["entry"]) if _mt_sig else 0.0
+        _mt_tp_def    = float(_mt_sig["tp"])    if _mt_sig else 0.0
+        _mt_sl_def    = float(_mt_sig["sl"])    if _mt_sig else 0.0
+
+        mc1, mc2, mc3 = st.columns(3)
+        mt_entry = mc1.number_input("Entry price (0 = live market)",
+                                    min_value=0.0, value=_mt_entry_def,
+                                    format="%.8f", key="mt_entry")
+        mt_tp    = mc2.number_input("TP price",
+                                    min_value=0.0, value=_mt_tp_def,
+                                    format="%.8f", key="mt_tp")
+        mt_sl    = mc3.number_input("SL price",
+                                    min_value=0.0, value=_mt_sl_def,
+                                    format="%.8f", key="mt_sl")
+
+        md1, md2 = st.columns(2)
+        mt_usdt = md1.number_input("Size (USDT collateral)",
+                                   min_value=1.0, value=float(_snap_cfg.get("trade_usdt_amount", 10)),
+                                   key="mt_usdt")
+        mt_lev  = md2.number_input("Leverage ×",
+                                   min_value=1, max_value=125,
+                                   value=int(_snap_cfg.get("trade_leverage", 10)),
+                                   key="mt_lev")
+
+        if _mt_sig:
+            st.caption(f"ℹ️ Pre-filled from open signal for {mt_sym} "
+                       f"(entry {_mt_entry_def}, TP {_mt_tp_def}, SL {_mt_sl_def})")
+
+        # Hint: if TP/SL are 0, show what will be calculated
+        if mt_entry > 0:
+            _mt_tp_hint = mt_tp if mt_tp > 0 else mt_entry * (1 + _snap_cfg.get("tp_pct",1.5)/100)
+            _mt_sl_hint = (mt_sl if mt_sl > 0
+                           else mt_entry * (1 - 1/max(1,mt_lev)) if mt_mode == "isolated"
+                           else mt_entry * (1 - _snap_cfg.get("sl_pct",3.0)/100))
+            st.caption(f"📋 Will place **LIMIT** buy at {mt_entry} "
+                       f"· TP: {_pround(_mt_tp_hint)} · SL: {_pround(_mt_sl_hint)}")
+        else:
+            st.caption("📋 Entry = 0 → **MARKET** buy at live price · "
+                       "TP/SL from configured % if left at 0")
+
+        if st.button("🚀 Place Manual Trade", type="primary", key="mt_place"):
+            _mt_cfg = dict(_snap_cfg)
+            _mt_cfg["trade_usdt_amount"] = mt_usdt
+            _mt_cfg["trade_leverage"]    = mt_lev
+            _mt_cfg["trade_margin_mode"] = mt_mode
+
+            # TP/SL: use user values if provided, else fall back to config %
+            # (only relevant when entry == 0, i.e. market order)
+            _ref = mt_entry if mt_entry > 0 else 0
+            _mt_tp_use = mt_tp if mt_tp > 0 else (_ref * (1 + _snap_cfg.get("tp_pct",1.5)/100) if _ref else 0)
+            _mt_sl_use = (mt_sl if mt_sl > 0
+                          else (_ref * (1 - 1/max(1,mt_lev)) if mt_mode == "isolated"
+                                else _ref * (1 - _snap_cfg.get("sl_pct",3.0)/100))
+                          if _ref else 0)
+
+            with st.spinner(f"Placing {'LIMIT' if mt_entry > 0 else 'MARKET'} order for {mt_sym}…"):
+                _mt_result = place_okx_manual_order(
+                    mt_sym, mt_entry, _mt_tp_use, _mt_sl_use, _mt_cfg)
+
+            st.session_state["_mt_last_result"] = _mt_result
+
+        # ── Show last manual trade result ─────────────────────────────────────
+        _mt_res = st.session_state.get("_mt_last_result")
+        if _mt_res:
+            _mt_status = _mt_res.get("status", "")
+            _mt_err    = _mt_res.get("error", "")
+            if _mt_status == "placed":
+                st.success(f"✅ Placed · Order ID: {_mt_res.get('ordId')} "
+                           f"· Algo ID: {_mt_res.get('algoId')} "
+                           f"· Contracts: {_mt_res.get('sz')}")
+            elif _mt_status == "partial":
+                st.warning(f"⚠️ {_mt_err}")
+            else:
+                st.error(f"❌ {_mt_err}")
+
+            # Show full raw OKX request/response for debugging
+            _mt_raw = getattr(_b, "_bsc_last_trade_raw", {})
+            if _mt_raw:
+                st.markdown(f"**Entry order — {_mt_raw.get('endpoint','')}**")
+                st.json(_mt_raw.get("body_sent", {}))
+                st.markdown("**OKX entry response:**")
+                st.json(_mt_raw.get("response", {}))
+                if _mt_raw.get("algo_body_sent"):
+                    st.markdown("**OCO algo order sent:**")
+                    st.json(_mt_raw["algo_body_sent"])
+                    st.markdown("**OKX OCO response:**")
+                    st.json(_mt_raw.get("algo_response", {}))
+                st.caption(
+                    f"is_hedge={_mt_raw.get('is_hedge')}  "
+                    f"contracts={_mt_raw.get('contracts','?')}  "
+                    f"ct_val={_mt_raw.get('ct_val','?')}")
+
+# ── Charts ─────────────────────────────────────────────────────────────────────
+if signals:
+    st.divider()
+    ch1, ch2 = st.columns(2)
+    sec_counts: dict = {}
+    for s in signals:
+        k = s.get("sector","Other"); sec_counts[k] = sec_counts.get(k,0)+1
+    ch1.plotly_chart(go.Figure(go.Pie(
+        labels=list(sec_counts.keys()), values=list(sec_counts.values()),
+        hole=0.4, marker=dict(colors=px.colors.qualitative.Dark24)
+    )).update_layout(title="Signals by Sector", paper_bgcolor="rgba(0,0,0,0)",
+                     plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#e6edf3"),
+                     margin=dict(t=40,b=10,l=10,r=10)),
+                     use_container_width=True)
+    outcome = {"Open":open_count,"TP Hit":tp_count,"SL Hit":sl_count}
+    ch2.plotly_chart(go.Figure(go.Bar(
+        x=list(outcome.keys()), y=list(outcome.values()),
+        marker_color=["#58a6ff","#3fb950","#f85149"],
+        text=list(outcome.values()), textposition="outside"
+    )).update_layout(title="Signal Outcomes", paper_bgcolor="rgba(0,0,0,0)",
+                     plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#e6edf3"),
+                     yaxis=dict(gridcolor="#21262d"), margin=dict(t=40,b=10,l=10,r=10)),
+                     use_container_width=True)
+
+    if len(signals) > 1:
+        from collections import Counter
+        dc: Counter = Counter()
+        for s in signals:
+            try:
+                d = to_dubai(datetime.fromisoformat(s["timestamp"].replace("Z","+00:00"))).strftime("%m/%d")
+                dc[d] += 1
+            except Exception: pass
+        if dc:
+            days = sorted(dc.keys())
+            st.plotly_chart(go.Figure(go.Bar(
+                x=days, y=[dc[d] for d in days],
+                marker_color="#d29922", text=[dc[d] for d in days], textposition="outside"
+            )).update_layout(title="Signals Per Day (Dubai/GST)", paper_bgcolor="rgba(0,0,0,0)",
+                             plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#e6edf3"),
+                             yaxis=dict(gridcolor="#21262d"), margin=dict(t=40,b=10,l=10,r=10)),
+                             use_container_width=True)
+
+# ── Filter funnel ──────────────────────────────────────────────────────────────
+# Deep-copy under lock so background thread can't mutate lists mid-render
+with _filter_lock:
+    fc = {k: (list(v) if isinstance(v, list) else v) for k, v in _filter_counts.items()}
+if fc.get("total_watchlist", 0) > 0:
+    with st.expander("🔬 Last scan filter funnel"):
+        total     = fc.get("total_watchlist", 0)
+        pre_out_n = fc.get("pre_filtered_out", 0)
+        after_pre = total - pre_out_n
+        checked   = fc.get("checked", after_pre)
+        after_f2  = checked   - fc.get("f2_pdz15m", 0)
+        after_f3  = after_f2  - fc.get("f3_pdz5m",  0)
+        after_f4  = after_f3  - fc.get("f4_rsi5m",  0)
+        after_f5  = after_f4  - fc.get("f5_rsi1h",  0)
+        after_f6  = after_f5  - fc.get("f6_ema",    0)
+        # F7 MACD — per timeframe running totals
+        after_f7_macd_3m  = after_f6  - fc.get("f7_macd_3m",  0)
+        after_f7_macd_5m  = after_f7_macd_3m  - fc.get("f7_macd_5m",  0)
+        after_f7_macd_15m = after_f7_macd_5m  - fc.get("f7_macd_15m", 0)
+        # F8 SAR — per timeframe running totals
+        after_f8_sar_3m   = after_f7_macd_15m - fc.get("f8_sar_3m",  0)
+        after_f8_sar_5m   = after_f8_sar_3m   - fc.get("f8_sar_5m",  0)
+        after_f8_sar_15m  = after_f8_sar_5m   - fc.get("f8_sar_15m", 0)
+        after_f9           = after_f8_sar_15m  - fc.get("f9_vol",       0)
+        after_empty        = after_f9          - fc.get("f_empty_data", 0)
+
+        # Use the config that was ACTIVE during the last scan for labels
+        sc = fc.get("scan_cfg") or _snap_cfg
+
+        if sc is not _snap_cfg and sc != _snap_cfg:
+            st.caption("⚠️ Config changed since last scan — funnel reflects the previous settings. "
+                       "Rescan is in progress with the new config.")
+
+        pre_lbl    = "⚡ After Bulk Pre-filter" if sc.get("use_pre_filter", True) else "⚡ Pre-filter (disabled)"
+        pdz15m_lbl = "F2 — PDZ Zones (15m)" if sc.get("use_pdz_15m", True) else "F2 — PDZ 15m (off)"
+        pdz5m_lbl  = "F3 — PDZ Zones (5m)"  if sc.get("use_pdz_5m",  True) else "F3 — PDZ 5m (off)"
+        f4_lbl     = f"F4 — 5m RSI \u2265{sc.get('rsi_5m_min',30)}" if sc.get("use_rsi_5m", True) else "F4 — 5m RSI (off)"
+        f5_lbl     = (f"F5 — 1h RSI {sc.get('rsi_1h_min',30)}\u2013{sc.get('rsi_1h_max',95)}"
+                      if sc.get("use_rsi_1h", True) else "F5 — 1h RSI (off)")
+        ema_parts = []
+        if sc.get("use_ema_3m"):  ema_parts.append(f"3m EMA{sc.get('ema_period_3m',12)}")
+        if sc.get("use_ema_5m"):  ema_parts.append(f"5m EMA{sc.get('ema_period_5m',12)}")
+        if sc.get("use_ema_15m"): ema_parts.append(f"15m EMA{sc.get('ema_period_15m',12)}")
+        ema_lbl = ("F6 — EMA (" + (" · ".join(ema_parts)) + ")") if ema_parts else "F6 — EMA (off)"
+        vol_lbl = (f"F9 — Vol \u2265{sc.get('vol_spike_mult',2.0)}\xd7 / {sc.get('vol_spike_lookback',20)} 15m"
+                   if sc.get("use_vol_spike") else "F9 — Vol (off)")
+
+        # Build funnel rows — only include MACD/SAR timeframes that are enabled
+        funnel_data = [
+            (f"Watchlist ({total})",       total),
+            (pre_lbl,                      after_pre),
+            ("Entered Deep Scan",          checked),
+            (f"After {pdz15m_lbl}",        after_f2),
+            (f"After {pdz5m_lbl}",         after_f3),
+            (f"After {f4_lbl}",            after_f4),
+            (f"After {f5_lbl}",            after_f5),
+            (f"After {ema_lbl}",           after_f6),
+        ]
+        # F7 MACD — add a row per enabled timeframe
+        _prev_macd = after_f6
+        for _tf, _key, _after in [
+            ("3m",  "use_macd_3m",  after_f7_macd_3m),
+            ("5m",  "use_macd_5m",  after_f7_macd_5m),
+            ("15m", "use_macd_15m", after_f7_macd_15m),
+        ]:
+            if sc.get(_key, True):
+                funnel_data.append((f"F7 — MACD \U0001f7e2\u2191 {_tf}", _after))
+                _prev_macd = _after
+            # If disabled keep running value the same (no row added, count unchanged)
+        # F8 SAR — add a row per enabled timeframe
+        _prev_sar = _prev_macd
+        for _tf, _key, _after in [
+            ("3m",  "use_sar_3m",  after_f8_sar_3m),
+            ("5m",  "use_sar_5m",  after_f8_sar_5m),
+            ("15m", "use_sar_15m", after_f8_sar_15m),
+        ]:
+            if sc.get(_key, True):
+                funnel_data.append((f"F8 — SAR {_tf}", _after))
+                _prev_sar = _after
+
+        funnel_data.append((f"After {vol_lbl}",           after_f9))
+        funnel_data.append(("After \u26a0\ufe0f Empty Candle Drop", after_empty))
+
+        # Colour palette — generate enough colours for variable row count
+        _palette = ["#1f6feb","#388bfd","#58a6ff","#79c0ff","#a5d6ff",
+                    "#3fb950","#56d364","#7ee787","#40c8b8","#26a69a",
+                    "#d29922","#e3b341","#f0a500","#f85149","#ff6b6b"]
+        _colours = (_palette * ((len(funnel_data) // len(_palette)) + 1))[:len(funnel_data)]
+
+        fig_funnel = go.Figure(go.Funnel(
+            y=[d[0] for d in funnel_data],
+            x=[d[1] for d in funnel_data],
+            marker=dict(color=_colours),
+            textinfo="value+percent initial",
+        ))
+        fig_funnel.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#e6edf3"), margin=dict(t=10,b=10,l=10,r=10), height=500)
+        st.plotly_chart(fig_funnel, use_container_width=True)
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("Pre-filtered out ⚡", pre_out_n, help="Removed cheaply — no candle API calls used")
+        col_b.metric("Deep scanned 🔬",     checked,   help="Received full multi-timeframe candle analysis")
+        col_c.metric("Errors",              fc.get("errors",0))
+        super_n = fc.get("super_setup", 0)
+        if super_n:
+            st.success(f"⭐ {super_n} Super Setup(s) this cycle — 15m Discount zone instant buy!")
+
+        # ── Qualified coins table — one row per filter stage ────────────────────
+        st.markdown("#### 🪙 Qualified Coins at Each Stage")
+        st.caption("Shows which coins survived after each filter was applied in the last scan cycle.")
+
+        def _coin_str(s: set) -> str:
+            return ", ".join(sorted(s)) if s else "—"
+
+        # Build remaining sets by subtracting eliminated coins stage-by-stage
+        _pre  = set(fc.get("pre_filter_passed_syms", []))
+        _chk  = set(fc.get("checked_syms", []))
+        _f2e  = set(fc.get("f2_elim_syms",  []))
+        _f3e  = set(fc.get("f3_elim_syms",  []))
+        _f4e  = set(fc.get("f4_elim_syms",  []))
+        _f5e  = set(fc.get("f5_elim_syms",  []))
+        _f6e  = set(fc.get("f6_elim_syms",  []))
+        # F7 MACD — per timeframe elimination sets
+        _f7e_3m  = set(fc.get("f7_macd_3m_elim_syms",  []))
+        _f7e_5m  = set(fc.get("f7_macd_5m_elim_syms",  []))
+        _f7e_15m = set(fc.get("f7_macd_15m_elim_syms", []))
+        # F8 SAR — per timeframe elimination sets
+        _f8e_3m  = set(fc.get("f8_sar_3m_elim_syms",  []))
+        _f8e_5m  = set(fc.get("f8_sar_5m_elim_syms",  []))
+        _f8e_15m = set(fc.get("f8_sar_15m_elim_syms", []))
+        _f9e    = set(fc.get("f9_elim_syms",      []))
+        _fempty = set(fc.get("f_empty_data_syms", []))
+
+        _after_f2        = _chk          - _f2e
+        _after_f3        = _after_f2     - _f3e
+        _after_f4        = _after_f3     - _f4e
+        _after_f5        = _after_f4     - _f5e
+        _after_f6        = _after_f5     - _f6e
+        # MACD per timeframe — only subtract if that timeframe is enabled
+        _after_f7_macd_3m  = _after_f6          - (_f7e_3m  if sc.get("use_macd_3m",  True) else set())
+        _after_f7_macd_5m  = _after_f7_macd_3m  - (_f7e_5m  if sc.get("use_macd_5m",  True) else set())
+        _after_f7_macd_15m = _after_f7_macd_5m  - (_f7e_15m if sc.get("use_macd_15m", True) else set())
+        # SAR per timeframe
+        _after_f8_sar_3m   = _after_f7_macd_15m - (_f8e_3m  if sc.get("use_sar_3m",  True) else set())
+        _after_f8_sar_5m   = _after_f8_sar_3m   - (_f8e_5m  if sc.get("use_sar_5m",  True) else set())
+        _after_f8_sar_15m  = _after_f8_sar_5m   - (_f8e_15m if sc.get("use_sar_15m", True) else set())
+        _after_f9          = _after_f8_sar_15m  - _f9e
+        _fempty_syms = {s.split("(")[0] for s in _fempty}
+        _after_empty = _after_f9 - _fempty_syms
+
+        _process_err_count = max(0, fc.get("errors", 0))
+        _new_sig_s    = set(fc.get("new_signal_syms",         []))
+        _blk_active_s = set(fc.get("blocked_by_active_syms", []))
+        _blk_cool_s   = set(fc.get("blocked_by_cooldown_syms",[]))
+        _returned_syms = _new_sig_s | _blk_active_s | _blk_cool_s
+
+        # Fixed opening rows
+        stage_rows = [
+            ("⚡ After Bulk Pre-filter",  len(_pre),      _coin_str(_pre)),
+            ("🔬 Entered Deep Scan",      len(_chk),      _coin_str(_chk)),
+            (f"After {pdz15m_lbl}",       len(_after_f2), _coin_str(_after_f2)),
+            (f"After {pdz5m_lbl}",        len(_after_f3), _coin_str(_after_f3)),
+            (f"After {f4_lbl}",           len(_after_f4), _coin_str(_after_f4)),
+            (f"After {f5_lbl}",           len(_after_f5), _coin_str(_after_f5)),
+            (f"After {ema_lbl}",          len(_after_f6), _coin_str(_after_f6)),
+        ]
+        # F7 MACD — one row per enabled timeframe
+        for _tf, _key, _after_set in [
+            ("3m",  "use_macd_3m",  _after_f7_macd_3m),
+            ("5m",  "use_macd_5m",  _after_f7_macd_5m),
+            ("15m", "use_macd_15m", _after_f7_macd_15m),
+        ]:
+            if sc.get(_key, True):
+                stage_rows.append((
+                    f"F7 — MACD \U0001f7e2\u2191 {_tf}",
+                    len(_after_set),
+                    _coin_str(_after_set),
+                ))
+        # F8 SAR — one row per enabled timeframe
+        for _tf, _key, _after_set in [
+            ("3m",  "use_sar_3m",  _after_f8_sar_3m),
+            ("5m",  "use_sar_5m",  _after_f8_sar_5m),
+            ("15m", "use_sar_15m", _after_f8_sar_15m),
+        ]:
+            if sc.get(_key, True):
+                stage_rows.append((
+                    f"F8 — SAR {_tf}",
+                    len(_after_set),
+                    _coin_str(_after_set),
+                ))
+        # Fixed closing rows
+        stage_rows += [
+            (f"After {vol_lbl}",               len(_after_f9),        _coin_str(_after_f9)),
+            ("⚠️ Dropped — Empty Candle Data", len(_fempty),          ", ".join(sorted(_fempty)) if _fempty else "—"),
+            ("💥 Dropped — Process Error",     _process_err_count,    "See API Error Log below ↓"),
+            ("✅ Returned Signal",             len(_returned_syms),   _coin_str(_returned_syms)),
+            ("🔵 Blocked — Open trade exists", len(_blk_active_s),    _coin_str(_blk_active_s)),
+            ("🟡 Blocked — Cooldown active",   len(_blk_cool_s),      _coin_str(_blk_cool_s)),
+            ("🟢 New Signals Fired",           len(_new_sig_s),       _coin_str(_new_sig_s)),
+        ]
+
+        st.dataframe(
+            [{"Filter Stage": r[0], "Count": r[1], "Qualified Coins": r[2]} for r in stage_rows],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Filter Stage":    st.column_config.TextColumn(width="medium"),
+                "Count":           st.column_config.NumberColumn(width="small"),
+                "Qualified Coins": st.column_config.TextColumn(width="large"),
+            }
+        )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API Error Log  (bottom of page)
+# ─────────────────────────────────────────────────────────────────────────────
+st.divider()
+
+with getattr(_b, "_bsc_error_log_lock", threading.Lock()):
+    _err_snap = list(getattr(_b, "_bsc_error_log", []))
+
+_TYPE_ICON  = {"scan": "🔴", "trade": "🟠", "loop": "🟣", "http": "🔵"}
+_TYPE_LABEL = {"scan": "Scan/Candle", "trade": "Trade/Order",
+               "loop": "Scanner loop", "http": "HTTP/Network"}
+
+_err_count = len(_err_snap)
+_err_label = f"⚠️ API Error Log — {_err_count} entr{'y' if _err_count == 1 else 'ies'}"
+
+with st.expander(_err_label, expanded=(_err_count > 0)):
+    if not _err_snap:
+        st.success("✅ No errors recorded yet.")
+    else:
+        ecol1, ecol2 = st.columns([1, 1])
+
+        # ── Summary counts by type ─────────────────────────────────────────
+        _type_counts = {}
+        for _e in _err_snap:
+            _type_counts[_e["type"]] = _type_counts.get(_e["type"], 0) + 1
+        _summary = "  ·  ".join(
+            f"{_TYPE_ICON.get(t,'⚪')} {_TYPE_LABEL.get(t,t)}: **{n}**"
+            for t, n in sorted(_type_counts.items())
+        )
+        ecol1.markdown(_summary)
+
+        # ── Clear button ──────────────────────────────────────────────────
+        if ecol2.button("🗑 Clear error log", key="clear_err_log"):
+            with _b._bsc_error_log_lock:
+                _b._bsc_error_log.clear()
+            st.rerun()
+
+        # ── Type filter ───────────────────────────────────────────────────
+        _all_types = sorted({e["type"] for e in _err_snap})
+        _filt_cols = st.columns(len(_all_types) + 1)
+        _sel_type  = st.session_state.get("err_type_filter", "All")
+        if _filt_cols[0].button("All", key="err_f_all",
+                                type="primary" if _sel_type == "All" else "secondary"):
+            st.session_state["err_type_filter"] = "All"; st.rerun()
+        for _fi, _ft in enumerate(_all_types):
+            if _filt_cols[_fi + 1].button(
+                    f"{_TYPE_ICON.get(_ft,'')} {_TYPE_LABEL.get(_ft,_ft)}",
+                    key=f"err_f_{_ft}",
+                    type="primary" if _sel_type == _ft else "secondary"):
+                st.session_state["err_type_filter"] = _ft; st.rerun()
+
+        # ── Error table ───────────────────────────────────────────────────
+        _sel_type = st.session_state.get("err_type_filter", "All")
+        _shown    = [e for e in reversed(_err_snap)
+                     if _sel_type == "All" or e["type"] == _sel_type]
+        _err_rows = []
+        for _e in _shown:
+            _err_rows.append({
+                "Time (GST)": fmt_dubai(_e["ts"]),
+                "Type":       f"{_TYPE_ICON.get(_e['type'],'')} {_TYPE_LABEL.get(_e['type'],_e['type'])}",
+                "Symbol":     _e.get("symbol", "—") or "—",
+                "Endpoint":   _e.get("endpoint", "—") or "—",
+                "Error":      _e.get("message", ""),
+            })
+        st.dataframe(
+            _err_rows,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Time (GST)": st.column_config.TextColumn(width="small"),
+                "Type":       st.column_config.TextColumn(width="medium"),
+                "Symbol":     st.column_config.TextColumn(width="small"),
+                "Endpoint":   st.column_config.TextColumn(width="medium"),
+                "Error":      st.column_config.TextColumn(width="large"),
+            },
+        )
+        st.caption(f"Showing {len(_err_rows)} of {_err_count} entries (newest first) · max {_ERROR_LOG_MAX} kept")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-refresh
+# ─────────────────────────────────────────────────────────────────────────────
+time.sleep(30)
+st.rerun()
