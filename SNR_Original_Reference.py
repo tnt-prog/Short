@@ -533,6 +533,11 @@ if "_scanner_initialised" not in st.session_state:
         _b._bsc_running.set()
         _b._bsc_thread        = None
         _b._bsc_filter_counts = {}
+        # Snapshot of the LAST COMPLETED scan's filter counts. The UI reads this
+        # (not the live _bsc_filter_counts) so the funnel never shows an empty
+        # state during the brief window between _reset_filter_counts() and
+        # the new scan populating data. Updated atomically at end of each scan.
+        _b._bsc_filter_counts_last = {}
         _b._bsc_filter_lock   = threading.Lock()
         _b._bsc_last_error    = ""
         _b._bsc_rescan_event  = threading.Event()   # set to skip sleep & rescan immediately
@@ -560,6 +565,10 @@ _log_lock        = _b._bsc_log_lock
 _scanner_running = _b._bsc_running
 _filter_lock     = _b._bsc_filter_lock
 _filter_counts   = _b._bsc_filter_counts
+# Stable snapshot of last COMPLETED scan (UI reads this to avoid mid-reset races)
+if not hasattr(_b, "_bsc_filter_counts_last"):
+    _b._bsc_filter_counts_last = {}
+_filter_counts_last = _b._bsc_filter_counts_last
 _rescan_event    = _b._bsc_rescan_event
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2228,6 +2237,24 @@ def scan(cfg: dict):
             if r and r != "error":
                 results.append(r)
 
+    # ── Publish a stable snapshot of this completed scan for the UI ─────────
+    # The UI reads from _bsc_filter_counts_last so it never sees a mid-reset
+    # empty state during the next cycle's _reset_filter_counts() call.
+    # Note: new_signal/blocked/queued symbol lists are populated slightly later
+    # in _bg_loop() — those get merged into the snapshot there.
+    with _filter_lock:
+        _snap = {k: (list(v) if isinstance(v, list)
+                     else dict(v) if isinstance(v, dict)
+                     else v)
+                 for k, v in _filter_counts.items()}
+        # deep-copy one level into per-direction buckets' lists
+        for _d in ("long", "short"):
+            if isinstance(_snap.get(_d), dict):
+                _snap[_d] = {k: (list(v) if isinstance(v, list) else v)
+                             for k, v in _snap[_d].items()}
+        _b._bsc_filter_counts_last.clear()
+        _b._bsc_filter_counts_last.update(_snap)
+
     return sorted(results, key=lambda x: (x["symbol"], x.get("direction","long"))), _filter_counts.get("errors", 0)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2400,11 +2427,24 @@ def _bg_loop():
                         _filter_counts[d]["queued_syms"]              = d_queued
                         _filter_counts[d]["blocked_by_active_syms"]   = d_active
                         _filter_counts[d]["blocked_by_cooldown_syms"] = d_cool
+                    # Mirror into the published snapshot too
+                    with _filter_lock:
+                        if d in _b._bsc_filter_counts_last and isinstance(_b._bsc_filter_counts_last[d], dict):
+                            _b._bsc_filter_counts_last[d]["new_signal_syms"]          = list(d_new)
+                            _b._bsc_filter_counts_last[d]["queued_syms"]              = list(d_queued)
+                            _b._bsc_filter_counts_last[d]["blocked_by_active_syms"]   = list(d_active)
+                            _b._bsc_filter_counts_last[d]["blocked_by_cooldown_syms"] = list(d_cool)
                 # Combined top-level convenience lists (UI uses these too)
                 _filter_counts["new_signal_syms"]         = _added_syms
                 _filter_counts["queued_syms"]             = _queued_syms
                 _filter_counts["blocked_by_active_syms"]  = _blocked_active
                 _filter_counts["blocked_by_cooldown_syms"]= _blocked_cooldown
+                # Mirror top-level outcome lists into the snapshot
+                with _filter_lock:
+                    _b._bsc_filter_counts_last["new_signal_syms"]          = list(_added_syms)
+                    _b._bsc_filter_counts_last["queued_syms"]              = list(_queued_syms)
+                    _b._bsc_filter_counts_last["blocked_by_active_syms"]   = list(_blocked_active)
+                    _b._bsc_filter_counts_last["blocked_by_cooldown_syms"] = list(_blocked_cooldown)
                 elapsed = time.time() - t0
                 # Aggregate health stats across both directions (for backwards-compat)
                 _pre_out = sum(_filter_counts.get(d, {}).get("pre_filtered_out", 0) for d in ("long","short"))
@@ -3155,6 +3195,9 @@ with st.sidebar:
         #     is reinitialised to zero-state, keeping the same object reference
         #     that the scanner thread uses — avoids the split-reference bug)
         _reset_filter_counts()
+        # Also clear the UI-facing snapshot so the funnel goes blank too
+        with _filter_lock:
+            _b._bsc_filter_counts_last.clear()
         # 3 — API error log
         with getattr(_b, "_bsc_error_log_lock", threading.Lock()):
             if hasattr(_b, "_bsc_error_log"):
@@ -3961,7 +4004,13 @@ def _deep_copy_fc(d):
     return d
 
 with _filter_lock:
-    fc = _deep_copy_fc(_filter_counts)
+    # Prefer the stable snapshot of the last COMPLETED scan so the funnel
+    # never shows an empty state during the brief window between the next
+    # cycle's _reset_filter_counts() and its first populated counters.
+    # Fall back to the live counts if no completed snapshot exists yet
+    # (first run, before any scan has finished).
+    _src = _b._bsc_filter_counts_last if _b._bsc_filter_counts_last.get("total_watchlist", 0) > 0 else _filter_counts
+    fc = _deep_copy_fc(_src)
 
 if fc.get("total_watchlist", 0) > 0:
     with st.expander("🔬 Last scan filter funnel"):
